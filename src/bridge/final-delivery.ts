@@ -3,7 +3,7 @@ import type { BotConfigBase } from '../config.js';
 import type { CardState } from '../types.js';
 import type { StreamProcessor, SessionManager } from '../engines/index.js';
 import type { Logger } from '../utils/logger.js';
-import type { IMessageSender } from './message-sender.interface.js';
+import type { IMessageSender, ReplyTarget } from './message-sender.interface.js';
 import { FINAL_CARD_BASE_DELAY_MS, FINAL_CARD_RETRIES } from './bridge-constants.js';
 import { createVoiceReplyOpus } from './voice-reply.js';
 
@@ -15,8 +15,10 @@ export async function sendFinalCardWithRetry(opts: {
   messageId: string;
   state: CardState;
   chatId?: string;
+  /** [本地私改·patch I] 话题锚点：文字兜底/语音回复也落回话题。 */
+  replyTo?: ReplyTarget;
 }): Promise<void> {
-  const { sender, config, logger, sessionManager, messageId, state, chatId } = opts;
+  const { sender, config, logger, sessionManager, messageId, state, chatId, replyTo } = opts;
 
   if (chatId && (state.status === 'complete' || state.status === 'error')) {
     sessionManager.addUsage(chatId, state.totalTokens ?? 0, state.costUsd ?? 0, state.durationMs ?? 0);
@@ -27,7 +29,7 @@ export async function sendFinalCardWithRetry(opts: {
   for (let attempt = 0; attempt < FINAL_CARD_RETRIES; attempt++) {
     const ok = await sender.updateCard(messageId, state);
     if (ok) {
-      void sendVoiceReplyIfEnabled({ sender, config, logger, chatId, state });
+      void sendVoiceReplyIfEnabled({ sender, config, logger, chatId, state, replyTo });
       return;
     }
     const delay = FINAL_CARD_BASE_DELAY_MS * Math.pow(2, attempt);
@@ -42,7 +44,7 @@ export async function sendFinalCardWithRetry(opts: {
       ? state.responseText.slice(0, 2000)
       : state.errorMessage || 'Task finished';
     try {
-      await sender.sendText(chatId, `${statusEmoji} ${summary}`);
+      await sender.sendText(chatId, `${statusEmoji} ${summary}`, replyTo?.messageId); // [本地私改·patch I]
     } catch {
       // Last resort failed; the card path already logged the delivery failure.
     }
@@ -55,14 +57,15 @@ export async function sendVoiceReplyIfEnabled(opts: {
   logger: Logger;
   chatId: string | undefined;
   state: CardState;
+  replyTo?: ReplyTarget;
 }): Promise<void> {
-  const { sender, config, logger, chatId, state } = opts;
+  const { sender, config, logger, chatId, state, replyTo } = opts;
   if (!chatId || state.status !== 'complete' || !state.responseText.trim() || !sender.sendAudioFile) return;
 
   const audio = await createVoiceReplyOpus(config, state.responseText, logger);
   if (!audio) return;
   try {
-    const sent = await sender.sendAudioFile(chatId, audio.filePath, audio.fileName);
+    const sent = await sender.sendAudioFile(chatId, audio.filePath, audio.fileName, replyTo); // [本地私改·patch I]
     if (!sent) {
       logger.warn({ chatId }, 'Voice reply audio send failed');
     }
@@ -78,8 +81,10 @@ export async function sendPlanContent(opts: {
   logger: Logger;
   chatId: string;
   processor: StreamProcessor;
+  /** [本地私改·patch I] 话题锚点：计划卡也落回话题。 */
+  replyTo?: ReplyTarget;
 }): Promise<void> {
-  const { sender, logger, chatId, processor } = opts;
+  const { sender, logger, chatId, processor, replyTo } = opts;
   let planContent = processor.getPlanContent() || '';
   if (!planContent.trim()) {
     const planPath = processor.getPlanFilePath();
@@ -94,5 +99,5 @@ export async function sendPlanContent(opts: {
   if (!planContent.trim()) return;
 
   logger.info({ chatId }, 'Sending plan content to user');
-  await sender.sendTextNotice(chatId, '📋 Plan', planContent, 'green');
+  await sender.sendTextNotice(chatId, '📋 Plan', planContent, 'green', replyTo); // [本地私改·patch I]
 }

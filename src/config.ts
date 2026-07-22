@@ -171,6 +171,10 @@ export interface BotConfig extends BotConfigBase {
   };
   /** When true, respond to all messages in group chats without requiring @mention. */
   groupNoMention?: boolean;
+  /** When true, ignore private (1-on-1) chats entirely; bot only works in group chats. */
+  groupOnly?: boolean;
+  /** open_ids allowed to private-chat even when groupOnly is on (e.g. the admin). */
+  groupOnlyAllowUsers?: string[];
 }
 
 /** Telegram bot config (extends base with Telegram credentials). */
@@ -305,6 +309,10 @@ export interface FeishuBotJsonEntry extends EngineJsonFields {
   downloadsDir?: string;
   /** When true, respond to all messages in group chats without requiring @mention. */
   groupNoMention?: boolean;
+  /** When true, ignore private (1-on-1) chats entirely; bot only works in group chats. */
+  groupOnly?: boolean;
+  /** open_ids allowed to private-chat even when groupOnly is on (e.g. the admin). */
+  groupOnlyAllowUsers?: string[];
 }
 
 function feishuBotFromJson(entry: FeishuBotJsonEntry): BotConfig {
@@ -321,6 +329,8 @@ function feishuBotFromJson(entry: FeishuBotJsonEntry): BotConfig {
     ...(entry.visible !== undefined ? { visible: entry.visible } : {}),
     ...(entry.memoryPublic !== undefined ? { memoryPublic: entry.memoryPublic } : {}),
     ...(entry.groupNoMention ? { groupNoMention: true } : {}),
+    ...(entry.groupOnly ? { groupOnly: true } : {}),
+    ...(entry.groupOnlyAllowUsers?.length ? { groupOnlyAllowUsers: entry.groupOnlyAllowUsers } : {}),
     ...(entry.engine ? { engine: entry.engine } : {}),
     ...(entry.kimi ? { kimi: entry.kimi } : {}),
     ...(codex ? { codex } : {}),

@@ -8,6 +8,7 @@ export type AuditEvent =
   | 'task_idle_timeout'
   | 'task_stopped'
   | 'task_queued'
+  | 'task_queued_merged'
   | 'queue_cleared'
   | 'command'
   | 'auth_denied'

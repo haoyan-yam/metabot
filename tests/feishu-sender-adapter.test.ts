@@ -114,6 +114,30 @@ describe('FeishuSenderAdapter.sendQuestionCard / updateQuestionCard', () => {
     const { adapter, fakeSender } = makeAdapter();
     fakeSender.sendAudioFile.mockResolvedValueOnce(true);
     await expect(adapter.sendAudioFile('oc_test', '/tmp/reply.opus')).resolves.toBe(true);
-    expect(fakeSender.sendAudioFile).toHaveBeenCalledWith('oc_test', '/tmp/reply.opus', 'reply.opus');
+    expect(fakeSender.sendAudioFile).toHaveBeenCalledWith('oc_test', '/tmp/reply.opus', 'reply.opus', undefined);
+  });
+
+  // [本地私改·patch I] 话题锚点透传：adapter 不解释 replyTo，只负责原样带给底层 sender。
+  it('forwards replyTo through sendCard / sendQuestionCard / sendTextNotice (patch I)', async () => {
+    const { adapter, sendCard } = makeAdapter();
+    const replyTo = { messageId: 'om_trigger', inThread: true };
+    await adapter.sendCard('oc_test', { status: 'running', userPrompt: 'p', responseText: '', toolCalls: [] }, replyTo);
+    await adapter.sendQuestionCard('oc_test', questionState, replyTo);
+    await adapter.sendTextNotice('oc_test', 'T', 'body', 'blue', replyTo);
+    expect(sendCard).toHaveBeenCalledTimes(3);
+    for (const call of sendCard.mock.calls) {
+      expect(call[2]).toEqual(replyTo);
+    }
+  });
+
+  it('forwards replyTo through sendImageFile / sendLocalFile / sendAudioFile (patch I)', async () => {
+    const { adapter, fakeSender } = makeAdapter();
+    const replyTo = { messageId: 'om_trigger', inThread: true };
+    await adapter.sendImageFile('oc_test', '/tmp/a.png', replyTo);
+    await adapter.sendLocalFile('oc_test', '/tmp/a.pdf', 'a.pdf', replyTo);
+    await adapter.sendAudioFile('oc_test', '/tmp/a.opus', 'a.opus', replyTo);
+    expect(fakeSender.sendImageFile).toHaveBeenCalledWith('oc_test', '/tmp/a.png', replyTo);
+    expect(fakeSender.sendLocalFile).toHaveBeenCalledWith('oc_test', '/tmp/a.pdf', 'a.pdf', 'pdf', replyTo);
+    expect(fakeSender.sendAudioFile).toHaveBeenCalledWith('oc_test', '/tmp/a.opus', 'a.opus', replyTo);
   });
 });

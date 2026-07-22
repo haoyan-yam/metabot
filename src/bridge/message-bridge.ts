@@ -1,9 +1,10 @@
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import type { BotConfigBase } from '../config.js';
 import type { Logger } from '../utils/logger.js';
 import type { BackgroundEvent, IncomingMessage, CardState, PendingQuestion, TeamState, TeamMember, TeamTask } from '../types.js';
-import type { IMessageSender } from './message-sender.interface.js';
+import type { IMessageSender, ReplyTarget } from './message-sender.interface.js';
 import type { DocSync } from '../sync/doc-sync.js';
 import type {
   Engine,
@@ -44,7 +45,7 @@ import { CodexCommandController } from './codex-command-controller.js';
 import { buildCodexGoalPrompt } from './codex-goal-policy.js';
 import { isContextOverflowError, isStaleSessionError } from './error-classifiers.js';
 import { sendFinalCardWithRetry, sendPlanContent } from './final-delivery.js';
-import { isDefaultMediaText, mergeBatchMessages, mergeBatchWithText, type PendingBatch } from './media-batch.js';
+import { isDefaultMediaText, mergeBatchMessages, mergeBatchWithText, mergeSameSenderMessages, type PendingBatch } from './media-batch.js';
 import { sendCompletionNotice } from './notification-policy.js';
 import { normalizePromptForEngine } from './prompt-normalizer.js';
 import { SlashPickerController } from './slash-picker-controller.js';
@@ -180,6 +181,18 @@ export class MessageBridge {
   readonly costTracker: CostTracker;
   private sessionRegistry?: SessionRegistry;
   private runningTasks = new Map<string, RunningTask>(); // keyed by chatId
+  // [本地私改·patch F] 每个 chat「最近开始的那个任务」的发起人（open_id + chatType）。
+  // 在 executeQuery 任务开始时写入 = 任务归属人（与 patch H 注入同源），供「选择卡 @ 提问人」用。
+  // ⚠️ 绝不能在 handleMessage 里按【每条消息】写：任务跑的过程中别人插一句（会被排队）就会
+  //    覆盖它，导致选择卡 @ 错人。2026-07-20 某客户群实测：甲的任务弹选择卡却 @ 到了乙
+  //    （乙在任务进行中插了句话，把「最后发言人」覆盖成了他）。
+  private lastTaskRequester = new Map<string, { userId: string; chatType: string }>();
+  // [本地私改·patch I] 每个 chat「最近开始的那个任务」的话题锚点（触发消息 id + thread id）。
+  // 话题内 @ 触发的任务：本轮所有出站消息（卡片/产物/通知）以回复该锚点的形式发送，落回话题。
+  // 与 lastTaskRequester 同点位写入（executeQuery 开始）；非话题任务写入时【删除】旧锚点。
+  // 刻意「粘性」不在 finally 清：turn 结束后 persistent executor 的跨轮提问卡仍需沿用；
+  // 该 chat 下一次任务开始时自然覆盖/清除。
+  private threadAnchors = new Map<string, { messageId: string; threadId: string }>();
   private messageQueues = new Map<string, IncomingMessage[]>(); // per-chatId message queue
   private pendingBatches = new Map<string, PendingBatch>(); // media debounce batches
   /**
@@ -674,6 +687,40 @@ export class MessageBridge {
   }
 
   /**
+   * [本地私改·patch F] 新的 AskUserQuestion 选择卡出现时，@【本任务发起人】触发飞书强提醒，
+   * 免得用户没看到、5 分钟(QUESTION_TIMEOUT_MS)后被自动超时。仅群聊触发
+   * （私聊本就每条 bot 消息都推送，无需 @）。走独立文本消息（Feishu 文本 @ 推送最可靠）。
+   * 来源 lastTaskRequester 在 executeQuery 任务开始时写入 = 任务归属人，不是「最后发言人」。
+   */
+  /**
+   * [本地私改·patch I] 当前任务的话题回复目标。任务由话题内消息触发时返回锚点
+   * （出站消息回复它即落回话题），否则返回 undefined（走普通主聊天发送，行为不变）。
+   */
+  private replyTargetFor(chatId: string): ReplyTarget | undefined {
+    const anchor = this.threadAnchors.get(chatId);
+    return anchor ? { messageId: anchor.messageId, inThread: true } : undefined;
+  }
+
+  /** [本地私改·patch I] 针对某条来消息本身的话题回复目标（排队/合并等即时通知用，不依赖任务锚点）。 */
+  private msgReplyTarget(msg: IncomingMessage): ReplyTarget | undefined {
+    return msg.threadId ? { messageId: msg.messageId, inThread: true } : undefined;
+  }
+
+  private async atRequesterForQuestion(chatId: string): Promise<void> {
+    const r = this.lastTaskRequester.get(chatId);
+    if (!r || r.chatType !== 'group' || !r.userId) return;
+    try {
+      await this.sender.sendText(
+        chatId,
+        `<at user_id="${r.userId}"></at> 需要你选择一下 👆（${QUESTION_TIMEOUT_MS / 60000} 分钟内有效，逾时按默认处理）`,
+        this.threadAnchors.get(chatId)?.messageId, // [本地私改·patch I] 话题任务的 @ 提醒也落话题
+      );
+    } catch (err) {
+      this.logger.warn({ err, chatId }, '[patch F] failed to @ requester for question card');
+    }
+  }
+
+  /**
    * Surface a between-turn AskUserQuestion as its own card on the chat.
    * Called from the `between-turn-question` executor event. The user's
    * next typed reply for this chatId is intercepted in
@@ -702,7 +749,7 @@ export class MessageBridge {
     if (payload.planText && payload.planText.trim()) {
       this.exitPlanCardsShown.add(chatId);
       try {
-        await this.sender.sendTextNotice(chatId, '📋 Plan', payload.planText, 'green');
+        await this.sender.sendTextNotice(chatId, '📋 Plan', payload.planText, 'green', this.replyTargetFor(chatId));
       } catch (err) {
         this.logger.warn({ err, chatId }, 'MessageBridge: failed to send plan card for between-turn ExitPlanMode');
       }
@@ -769,7 +816,8 @@ export class MessageBridge {
         ? this.sender.sendQuestionCard.bind(this.sender)
         : this.sender.sendCard.bind(this.sender);
       try {
-        cardMessageId = await send(chatId, card);
+        cardMessageId = await send(chatId, card, this.replyTargetFor(chatId)); // [本地私改·patch I] 话题任务的提问卡落话题
+        if (cardMessageId) void this.atRequesterForQuestion(chatId); // [本地私改·patch F] @ 提问人
       } catch (err) {
         this.logger.error({ err, chatId, toolUseId: payload.toolUseId }, 'MessageBridge: failed to send between-turn question card');
         return;
@@ -892,7 +940,7 @@ export class MessageBridge {
 
     // Image-only reply isn't a valid answer; nudge the user.
     if (imageKey && !text.trim()) {
-      await this.sender.sendText(chatId, '请用文字回复问题卡片中的选项编号或自定义答案。');
+      await this.sender.sendText(chatId, '请用文字回复问题卡片中的选项编号或自定义答案。', this.threadAnchors.get(chatId)?.messageId); // [本地私改·patch I]
       return true;
     }
 
@@ -1557,6 +1605,7 @@ export class MessageBridge {
           '⏳ Task In Progress',
           'You have a running task. Use `/stop` to abort it, or wait for it to finish.',
           'orange',
+          this.msgReplyTarget(msg), // [本地私改·patch I]
         );
         return;
       }
@@ -1608,12 +1657,35 @@ export class MessageBridge {
       }
 
       const queue = this.messageQueues.get(chatId) || [];
+
+      // Coalesce rapid-fire messages from the same sender: if the tail of the
+      // queue is already this user's message, merge into it instead of taking
+      // another slot. Cross-user ordering is preserved (only the tail merges),
+      // and merging is allowed even at MAX_QUEUE_SIZE since it doesn't grow the
+      // queue — a user can still refine their pending message when full.
+      const tail = queue[queue.length - 1];
+      // [本地私改·patch I] 追加 threadId 相等判断：不同话题的消息不合并（各自带各自的回复锚点）
+      if (tail && tail.userId === msg.userId && tail.threadId === msg.threadId) {
+        queue[queue.length - 1] = mergeSameSenderMessages(tail, msg);
+        this.messageQueues.set(chatId, queue);
+        this.audit.log({ event: 'task_queued_merged', botName: this.config.name, chatId, userId: msg.userId, prompt: msg.text, meta: { position: queue.length } });
+        await this.sender.sendTextNotice(
+          chatId,
+          '📋 Merged',
+          `Added to your pending message (position #${queue.length}). Your messages will run together after the current task finishes.`,
+          'blue',
+          this.msgReplyTarget(msg), // [本地私改·patch I]
+        );
+        return;
+      }
+
       if (queue.length >= MAX_QUEUE_SIZE) {
         await this.sender.sendTextNotice(
           chatId,
           '⏳ Queue Full',
           `Queue is full (${MAX_QUEUE_SIZE} pending). Use \`/stop\` to abort the current task, or wait.`,
           'orange',
+          this.msgReplyTarget(msg), // [本地私改·patch I]
         );
         return;
       }
@@ -1625,6 +1697,7 @@ export class MessageBridge {
         '📋 Queued',
         `Your message has been queued (position #${queue.length}). It will run after the current task finishes.`,
         'blue',
+        this.msgReplyTarget(msg), // [本地私改·patch I]
       );
       return;
     }
@@ -1666,7 +1739,7 @@ export class MessageBridge {
     const pending = task.pendingQuestion!;
 
     if (imageKey) {
-      await this.sender.sendText(chatId, '请用文字回复选择，或直接输入自定义答案。');
+      await this.sender.sendText(chatId, '请用文字回复选择，或直接输入自定义答案。', this.threadAnchors.get(chatId)?.messageId); // [本地私改·patch I]
       return;
     }
 
@@ -1717,7 +1790,7 @@ export class MessageBridge {
       const fn = this.sender.sendQuestionCard
         ? this.sender.sendQuestionCard.bind(this.sender)
         : this.sender.sendCard.bind(this.sender);
-      return fn(chatId, qState);
+      return fn(chatId, qState, this.replyTargetFor(chatId)); // [本地私改·patch I] 话题任务的提问卡落话题
     };
 
     // Check if more questions remain in this AskUserQuestion call
@@ -1875,7 +1948,7 @@ export class MessageBridge {
       if (queue.length < MAX_QUEUE_SIZE) {
         queue.push(merged);
         this.messageQueues.set(chatId, queue);
-        this.sender.sendTextNotice(chatId, '📋 Queued', `Your ${batch.messages.length} media message(s) have been queued.`, 'blue')
+        this.sender.sendTextNotice(chatId, '📋 Queued', `Your ${batch.messages.length} media message(s) have been queued.`, 'blue', this.msgReplyTarget(merged)) // [本地私改·patch I]
           .catch(() => {});
       }
       return;
@@ -1887,7 +1960,20 @@ export class MessageBridge {
   }
 
   private async executeQuery(msg: IncomingMessage): Promise<void> {
-    const { userId, chatId, text, imageKey, fileKey, fileName, messageId: msgId } = msg;
+    const { userId, chatId, text, imageKey, fileKey, fileName, messageId: msgId, chatType } = msg;
+
+    // [本地私改·patch F] 任务开始即记下发起人 = 本任务归属人。选择卡 @ 提问人时读它；
+    // 任务跑的过程中别人插话（会被排队、走别的路径）不会覆盖它，@ 的始终是发起本任务的人。
+    this.lastTaskRequester.set(chatId, { userId, chatType });
+
+    // [本地私改·patch I] 话题内触发的任务：记下话题锚点，本轮出站消息回复它、落回话题。
+    // 非话题任务必须【删除】旧锚点，否则上一个话题任务的锚点会把主聊天任务的输出带偏。
+    if (msg.threadId) {
+      this.threadAnchors.set(chatId, { messageId: msgId, threadId: msg.threadId });
+    } else {
+      this.threadAnchors.delete(chatId);
+    }
+
     const { session, engineName } = this.prepareSessionForExecution(chatId);
     const cwd = session.workingDirectory;
     const abortController = new AbortController();
@@ -1971,7 +2057,7 @@ export class MessageBridge {
       goalCondition: activeGoal,
     };
 
-    const messageId = await this.sender.sendCard(chatId, initialState);
+    const messageId = await this.sender.sendCard(chatId, initialState, this.replyTargetFor(chatId)); // [本地私改·patch I] 话题任务的流式卡落话题
 
     if (!messageId) {
       this.logger.error('Failed to send initial card, aborting');
@@ -2004,6 +2090,22 @@ export class MessageBridge {
         });
       }
     };
+
+    // [本地私改·patch H] 把「本条消息是谁发的」注入本回合 prompt —— 桥接原本
+    // 只把 sender open_id 用于审计/去重/@提醒，从不喂给模型，bot 要给「提问人」
+    // 发文档权限时只能翻聊天记录猜人、容易错授（实测曾错授过人）。注入 prompt 而非
+    // system prompt append：persistent 模式的 system prompt 在 executor 生命周期内
+    // 固定（会把首回合提问人冻结到整个长会话），且 prompt 注入天然覆盖
+    // claude/kimi/codex 三引擎的每一个回合。API 路径（runApiTask）不经过本函数。
+    if (userId) {
+      prompt =
+        `<system-reminder>\n` +
+        `本条消息的发送者（提问人）open_id: ${userId}\n` +
+        `给提问人授予文档编辑权限、@ 提问人时直接用这个 open_id，无需用 lark-cli 翻聊天记录反查。` +
+        `涉及授权时仍须先校验该 open_id 在当前群成员名单内。\n` +
+        `</system-reminder>\n\n` +
+        prompt;
+    }
 
     // One-shot restart reminder: if the bridge was just restarted (breadcrumb
     // from `metabot restart/update`), prepend a system-reminder to this chat's
@@ -2180,9 +2282,10 @@ export class MessageBridge {
             const sendQ = this.sender.sendQuestionCard
               ? this.sender.sendQuestionCard.bind(this.sender)
               : this.sender.sendCard.bind(this.sender);
-            const qMsgId = await sendQ(chatId, questionCardState);
+            const qMsgId = await sendQ(chatId, questionCardState, this.replyTargetFor(chatId)); // [本地私改·patch I] 话题任务的提问卡落话题
             if (qMsgId) {
               runningTask.questionCardMessageId = qMsgId;
+              void this.atRequesterForQuestion(chatId); // [本地私改·patch F] @ 提问人
             } else {
               // Sender refused. Fall back to the legacy in-card render so the
               // user still sees the question (even if mobile renders without
@@ -2361,10 +2464,15 @@ export class MessageBridge {
         chatId,
         state: lastState,
         durationMs,
+        // [本地私改] 仅群聊:完成通知作为「引用回复」发到触发消息上,让提问人
+        // 在答案就绪时才被通知(而不是开始思考时)。私聊传 undefined,行为不变。
+        replyToMessageId: chatType === 'group' ? msgId : undefined,
+        // [本地私改·patch J] 话题任务:通知里 @ 发起人且不受 10s 门槛限制
+        threadNotice: msg.threadId ? { atUserId: userId } : undefined,
       });
 
       // Send any output files produced by Claude
-      await this.outputHandler.sendOutputFiles(chatId, outputsDir, processor, lastState);
+      await this.outputHandler.sendOutputFiles(chatId, outputsDir, processor, lastState, this.replyTargetFor(chatId)); // [本地私改·patch I] 话题任务的产物落话题
       this.codexCommands.maybeScheduleGoalContinuation(
         msg,
         lastState,
@@ -2430,8 +2538,12 @@ export class MessageBridge {
             chatId,
             state: lastState,
             durationMs,
+            // [本地私改] 仅群聊:完成通知作为引用回复,通知落在答案就绪时(见另一处同款注释)
+            replyToMessageId: chatType === 'group' ? msgId : undefined,
+            // [本地私改·patch J] 话题任务:通知里 @ 发起人且不受 10s 门槛限制
+            threadNotice: msg.threadId ? { atUserId: userId } : undefined,
           });
-          await this.outputHandler.sendOutputFiles(chatId, outputsDir, processor, lastState);
+          await this.outputHandler.sendOutputFiles(chatId, outputsDir, processor, lastState, this.replyTargetFor(chatId)); // [本地私改·patch I]
           return; // skip the normal error handling below
         } catch (retryErr: any) {
           this.logger.error({ err: retryErr, chatId }, 'Retry after stale session also failed');
@@ -2474,14 +2586,18 @@ export class MessageBridge {
         metrics.setGauge('metabot_active_tasks', this.runningTasks.size);
         this.processQueue(chatId);
       }
-      if (imagePath) {
+      // [本地私改] 只清理落在系统 temp 里的下载；下载进持久项目目录（配了
+      // downloadsDir 的 bot，如 <project>/inputs）的上传文件保留，方便用户之后
+      // 说“再用一下那个文件”时 bot 仍能在本地找到，而不必让用户重新上传。
+      const inTmp = (p: string) => p.startsWith(os.tmpdir());
+      if (imagePath && inTmp(imagePath)) {
         try { fs.unlinkSync(imagePath); } catch { /* ignore */ }
       }
-      if (filePath) {
+      if (filePath && inTmp(filePath)) {
         try { fs.unlinkSync(filePath); } catch { /* ignore */ }
       }
       for (const p of extraPaths) {
-        try { fs.unlinkSync(p); } catch { /* ignore */ }
+        if (inTmp(p)) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
       }
       try { this.outputsManager.cleanup(outputsDir); } catch { /* ignore */ }
     }
@@ -2888,6 +3004,7 @@ export class MessageBridge {
       messageId,
       state: this.enrichWithAgentTeams(state, chatId),
       chatId,
+      replyTo: chatId ? this.replyTargetFor(chatId) : undefined, // [本地私改·patch I]
     });
   }
 
@@ -2895,7 +3012,7 @@ export class MessageBridge {
    * Read and send plan file content to the user when ExitPlanMode is triggered.
    */
   private async sendPlanContent(chatId: string, processor: StreamProcessor, _currentState: CardState): Promise<void> {
-    await sendPlanContent({ sender: this.sender, logger: this.logger, chatId, processor });
+    await sendPlanContent({ sender: this.sender, logger: this.logger, chatId, processor, replyTo: this.replyTargetFor(chatId) }); // [本地私改·patch I]
   }
 
   /**
@@ -2970,6 +3087,7 @@ export class MessageBridge {
     this.recentQuestionCard.clear();
     this.exitPlanCardsShown.clear();
     this.messageQueues.clear();
+    this.threadAnchors.clear(); // [本地私改·patch I]
     this.sessionManager.destroy();
     // Tear down persistent executors (Stage 2). This is the one inherently
     // async step: registry.shutdownAll awaits clean SDK/PTY process exit and

@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import type { Logger } from '../utils/logger.js';
 import type { CardState } from '../types.js';
-import type { IMessageSender } from './message-sender.interface.js';
+import type { IMessageSender, ReplyTarget } from './message-sender.interface.js';
 import { StreamProcessor, extractImagePaths } from '../engines/index.js';
 import { OutputsManager } from './outputs-manager.js';
 
@@ -42,9 +42,11 @@ export class OutputHandler {
     outputsDir: string,
     processor: StreamProcessor,
     state: CardState,
+    replyTo?: ReplyTarget, // [本地私改·patch I] 话题任务的产物回复到话题锚点
   ): Promise<void> {
     const sentPaths = new Set<string>();
     const oversized: OversizedFile[] = [];
+    const failedSends: { fileName: string; isImage: boolean }[] = []; // [本地私改·patch L] 经 K 重试仍失败的
 
     // 1. Scan the outputs directory for any files the agent placed there
     const outputFiles = this.outputsManager.scanOutputs(outputsDir);
@@ -52,14 +54,21 @@ export class OutputHandler {
       try {
         if (file.isImage && file.sizeBytes <= IMAGE_MAX_BYTES) {
           this.logger.info({ filePath: file.filePath }, 'Sending output image from outputs dir');
-          await this.sender.sendImageFile(chatId, file.filePath);
+          const ok = await this.sender.sendImageFile(chatId, file.filePath, replyTo);
+          if (!ok) failedSends.push({ fileName: file.fileName, isImage: true }); // [本地私改·patch L]
         } else if (!file.isImage && file.sizeBytes <= FILE_MAX_BYTES) {
           this.logger.info({ filePath: file.filePath }, 'Sending output file from outputs dir');
-          const sent = await this.sender.sendLocalFile(chatId, file.filePath, file.fileName);
-          if (!sent && OutputsManager.isTextFile(file.extension) && file.sizeBytes < 30 * 1024) {
-            this.logger.info({ filePath: file.filePath }, 'File upload failed, sending as text message');
-            const content = fs.readFileSync(file.filePath, 'utf-8');
-            await this.sender.sendText(chatId, `📄 ${file.fileName}\n\n${content}`);
+          const sent = await this.sender.sendLocalFile(chatId, file.filePath, file.fileName, replyTo);
+          if (!sent) {
+            if (OutputsManager.isTextFile(file.extension) && file.sizeBytes < 30 * 1024) {
+              // 小文本上传失败 → 直接把内容当文本贴出（已投递，不算失败）
+              this.logger.info({ filePath: file.filePath }, 'File upload failed, sending as text message');
+              const content = fs.readFileSync(file.filePath, 'utf-8');
+              await this.sender.sendText(chatId, `📄 ${file.fileName}\n\n${content}`, replyTo?.messageId);
+            } else {
+              // [本地私改·patch L] 经 K 重试仍失败、又没走文本兜底 → 记下，末尾统一告知，不再静默丢
+              failedSends.push({ fileName: file.fileName, isImage: false });
+            }
           }
         } else {
           // Track for a single end-of-batch notice so users know files exist
@@ -89,7 +98,8 @@ export class OutputHandler {
           if (size <= 0) continue;
           if (size <= IMAGE_MAX_BYTES) {
             this.logger.info({ imgPath }, 'Sending output image (fallback)');
-            await this.sender.sendImageFile(chatId, imgPath);
+            const ok = await this.sender.sendImageFile(chatId, imgPath, replyTo);
+            if (!ok) failedSends.push({ fileName: imgPath.split('/').pop() ?? imgPath, isImage: true }); // [本地私改·patch L]
           } else {
             // Same notice path as the outputs-dir scan — match user-visible behaviour.
             this.logger.warn({ imgPath, sizeBytes: size }, 'Fallback output image too large to send');
@@ -106,18 +116,38 @@ export class OutputHandler {
     //    the file. One coalesced notice for the whole batch instead of one
     //    per file so a 10-file batch with all-oversized doesn't spam.
     if (oversized.length > 0) {
-      await this.sendOversizedNotice(chatId, oversized);
+      await this.sendOversizedNotice(chatId, oversized, replyTo);
+    }
+
+    // 4. [本地私改·patch L] 经 patch K 重试后仍发送失败的文件/图片 → 明确告知，不再静默丢。
+    if (failedSends.length > 0) {
+      await this.sendFailedNotice(chatId, failedSends, replyTo);
     }
   }
 
-  private async sendOversizedNotice(chatId: string, files: OversizedFile[]): Promise<void> {
+  /**
+   * [本地私改·patch L] 上传经 patch K 重试仍失败时，末尾发一条软措辞通知，不再静默丢文件。
+   * 措辞刻意软化：极少数情况下 sent=false 但飞书其实已投递（投递步客户端超时 race），
+   * 说「如果没看到」而非硬「失败」，即便误报也只是「文件明明在啊」，不尴尬。
+   */
+  private async sendFailedNotice(chatId: string, files: { fileName: string; isImage: boolean }[], replyTo?: ReplyTarget): Promise<void> {
+    const list = files.map((f) => `- \`${f.fileName}\`${f.isImage ? ' (图片)' : ''}`).join('\n');
+    const body = `下面${files.length === 1 ? '这个文件' : `这 ${files.length} 个文件`}我已经生成好，但**发送到群里没成功**（飞书上传多次重试仍失败）。如果你在群里没看到，回我一声，我马上重发：\n\n${list}`;
+    try {
+      await this.sender.sendTextNotice(chatId, '⚠️ 有文件没发出来', body, 'red', replyTo);
+    } catch (err) {
+      this.logger.warn({ err, chatId, count: files.length }, 'Failed to send send-failure notice');
+    }
+  }
+
+  private async sendOversizedNotice(chatId: string, files: OversizedFile[], replyTo?: ReplyTarget): Promise<void> {
     const lines = [
       `Cannot send **${files.length}** file${files.length === 1 ? '' : 's'} because ${files.length === 1 ? 'it exceeds' : 'they exceed'} the Feishu upload limit (max ${IMAGE_MAX_BYTES / 1024 / 1024}MB images, ${FILE_MAX_BYTES / 1024 / 1024}MB files):`,
       '',
       ...files.map((f) => `- \`${f.fileName}\` — ${formatBytes(f.sizeBytes)}${f.isImage ? ' (image)' : ''}`),
     ];
     try {
-      await this.sender.sendTextNotice(chatId, '⚠️ Files Too Large', lines.join('\n'), 'orange');
+      await this.sender.sendTextNotice(chatId, '⚠️ Files Too Large', lines.join('\n'), 'orange', replyTo);
     } catch (err) {
       this.logger.warn({ err, chatId, count: files.length }, 'Failed to send oversized-file notice');
     }

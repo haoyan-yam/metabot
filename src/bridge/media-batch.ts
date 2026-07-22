@@ -44,3 +44,34 @@ export function mergeBatchWithText(batchMsgs: IncomingMessage[], textMsg: Incomi
     })),
   };
 }
+
+/**
+ * Merge a follow-up message into an earlier queued message from the SAME
+ * sender. Used to coalesce a person's rapid-fire messages while a task is
+ * running, so they run as a single turn instead of N serial turns. The earlier
+ * message stays the base (keeping its primary media slot); the follow-up's text
+ * is appended and its media folded into extraMedia. Default media placeholder
+ * texts (e.g. "请分析这张图片") are dropped when there is real text to keep.
+ */
+export function mergeSameSenderMessages(base: IncomingMessage, next: IncomingMessage): IncomingMessage {
+  const texts: string[] = [];
+  if (base.text && !isDefaultMediaText(base)) texts.push(base.text);
+  if (next.text && !isDefaultMediaText(next)) texts.push(next.text);
+
+  const extraMedia = [...(base.extraMedia ?? [])];
+  if (next.imageKey || next.fileKey) {
+    extraMedia.push({
+      messageId: next.messageId,
+      imageKey: next.imageKey,
+      fileKey: next.fileKey,
+      fileName: next.fileName,
+    });
+  }
+  if (next.extraMedia?.length) extraMedia.push(...next.extraMedia);
+
+  return {
+    ...base,
+    text: texts.length > 0 ? texts.join('\n') : base.text,
+    extraMedia: extraMedia.length > 0 ? extraMedia : undefined,
+  };
+}

@@ -35,6 +35,7 @@ interface RecordedNotice {
   title:   string;
   content: string;
   color?:  string;
+  replyTo?: unknown;
 }
 
 interface RecordedSend {
@@ -42,6 +43,7 @@ interface RecordedSend {
   chatId: string;
   filePath?: string;
   fileName?: string;
+  replyTo?: unknown;
 }
 
 function buildSender(opts: { failImage?: boolean; failFile?: boolean } = {}) {
@@ -50,18 +52,18 @@ function buildSender(opts: { failImage?: boolean; failFile?: boolean } = {}) {
   const sender = {
     sendCard:      async () => undefined,
     updateCard:    async () => true,
-    sendTextNotice: async (chatId: string, title: string, content: string, color?: string) => {
-      notices.push({ chatId, title, content, color });
+    sendTextNotice: async (chatId: string, title: string, content: string, color?: string, replyTo?: unknown) => {
+      notices.push({ chatId, title, content, color, replyTo });
     },
-    sendText:      async (chatId: string, text: string) => {
-      sends.push({ type: 'text', chatId, filePath: text });
+    sendText:      async (chatId: string, text: string, replyToMessageId?: string) => {
+      sends.push({ type: 'text', chatId, filePath: text, replyTo: replyToMessageId });
     },
-    sendImageFile: async (chatId: string, filePath: string) => {
-      sends.push({ type: 'image', chatId, filePath });
+    sendImageFile: async (chatId: string, filePath: string, replyTo?: unknown) => {
+      sends.push({ type: 'image', chatId, filePath, replyTo });
       return !opts.failImage;
     },
-    sendLocalFile: async (chatId: string, filePath: string, fileName: string) => {
-      sends.push({ type: 'file', chatId, filePath, fileName });
+    sendLocalFile: async (chatId: string, filePath: string, fileName: string, replyTo?: unknown) => {
+      sends.push({ type: 'file', chatId, filePath, fileName, replyTo });
       return !opts.failFile;
     },
     downloadImage: async () => true,
@@ -153,5 +155,27 @@ describe('OutputHandler.sendOutputFiles', () => {
     await new OutputHandler(mockLogger, sender, outputs).sendOutputFiles('chat-1', chatDir, mockProcessor, emptyState());
     expect(notices[0].content).toMatch(/1\*\* file because it exceeds/);
     expect(notices[0].content).not.toMatch(/files because they/);
+  });
+
+  // [本地私改·patch I] 话题任务的产物（图/文件/超大提示）全部回复到话题锚点。
+  it('forwards the thread reply anchor to every delivery path (patch I)', async () => {
+    fs.writeFileSync(path.join(chatDir, 'pic.png'),    Buffer.alloc(100));
+    fs.writeFileSync(path.join(chatDir, 'report.pdf'), Buffer.alloc(1024));
+    fs.writeFileSync(path.join(chatDir, 'huge.png'),   Buffer.alloc(10 * 1024 * 1024 + 1));
+    const { sender, sends, notices } = buildSender();
+    const replyTo = { messageId: 'om_trigger', inThread: true };
+    await new OutputHandler(mockLogger, sender, outputs).sendOutputFiles('chat-1', chatDir, mockProcessor, emptyState(), replyTo);
+    const delivered = sends.filter((s) => s.type !== 'text');
+    expect(delivered.length).toBe(2);
+    for (const s of delivered) expect(s.replyTo).toEqual(replyTo);
+    expect(notices).toHaveLength(1);              // oversized notice
+    expect(notices[0].replyTo).toEqual(replyTo);
+  });
+
+  it('omitting replyTo keeps legacy main-chat sends (regression)', async () => {
+    fs.writeFileSync(path.join(chatDir, 'pic.png'), Buffer.alloc(100));
+    const { sender, sends } = buildSender();
+    await new OutputHandler(mockLogger, sender, outputs).sendOutputFiles('chat-1', chatDir, mockProcessor, emptyState());
+    expect(sends[0].replyTo).toBeUndefined();
   });
 });

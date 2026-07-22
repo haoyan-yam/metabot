@@ -58,6 +58,27 @@ function clearCachedMedia(chatId: string, userId: string): void {
   pendingMediaCache.delete(cacheMediaKey(chatId, userId));
 }
 
+// Dedup cache for already-processed message ids. Feishu retries webhook delivery
+// (at-least-once) when the handler is slow to respond — e.g. a long-running task
+// or media download — so without dedup the same message gets processed repeatedly.
+const PROCESSED_MSG_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const processedMessages = new Map<string, number>(); // messageId -> ts
+
+/** Returns true if this messageId was already seen (and records it otherwise). */
+function isDuplicateMessage(messageId: string): boolean {
+  const now = Date.now();
+  // Opportunistic cleanup of stale entries
+  if (processedMessages.size > 500) {
+    for (const [id, ts] of processedMessages) {
+      if (now - ts > PROCESSED_MSG_TTL_MS) processedMessages.delete(id);
+    }
+  }
+  const seen = processedMessages.get(messageId);
+  if (seen !== undefined && now - seen < PROCESSED_MSG_TTL_MS) return true;
+  processedMessages.set(messageId, now);
+  return false;
+}
+
 async function isPrivateLikeGroup(chatId: string, sender: MessageSender): Promise<boolean> {
   const cached = memberCountCache.get(chatId);
   if (cached && Date.now() - cached.ts < MEMBER_COUNT_CACHE_TTL_MS) {
@@ -141,6 +162,31 @@ export function createEventDispatcher(
         const chatId = message.chat_id;
         const chatType = message.chat_type;
         const messageId = message.message_id;
+        const threadId = message.thread_id; // [本地私改·patch I] 话题内消息带 thread_id，回复须落回话题
+
+
+        // Dedup: Feishu retries delivery if we respond slowly (e.g. during a
+        // long task). Mark this messageId as seen up-front so retries are dropped.
+        if (messageId && isDuplicateMessage(messageId)) {
+          logger.debug({ messageId, msgType }, 'Duplicate message delivery ignored');
+          return;
+        }
+
+        // groupOnly mode: ignore private (1-on-1) chats entirely. Employees can
+        // only interact with the bot inside project groups. Reply once with a
+        // short hint so they know where to go, then drop the message.
+        const groupOnlyAllowed = config.groupOnlyAllowUsers?.includes(userId);
+        if (config.groupOnly && chatType !== 'group' && !groupOnlyAllowed) {
+          logger.info({ chatId, userId, chatType }, 'groupOnly mode: ignoring private chat message');
+          if (messageSender) {
+            try {
+              await messageSender.sendText(chatId, '你好,我只在项目群里工作,请到对应的项目群里 @我使用 🙂');
+            } catch (err) {
+              logger.warn({ err }, 'Failed to send groupOnly hint reply');
+            }
+          }
+          return;
+        }
 
         // In group chats, only respond when the bot is @mentioned
         // Exceptions: 2-member groups are treated like DMs; groupNoMention mode skips @mention check
@@ -282,7 +328,7 @@ export function createEventDispatcher(
           }
         }
 
-        onMessage({ messageId, chatId, chatType, userId, text, imageKey, fileKey, fileName, extraMedia });
+        onMessage({ messageId, chatId, chatType, userId, threadId, text, imageKey, fileKey, fileName, extraMedia });
       } catch (err) {
         logger.error({ err }, 'Error handling message event');
       }

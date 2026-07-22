@@ -1,5 +1,5 @@
 import * as path from 'node:path';
-import type { IMessageSender } from '../bridge/message-sender.interface.js';
+import type { IMessageSender, ReplyTarget } from '../bridge/message-sender.interface.js';
 import type { CardState } from '../types.js';
 import { MessageSender } from './message-sender.js';
 import { buildCard, buildTextCard } from './card-builder.js';
@@ -17,8 +17,8 @@ const USE_V2 = process.env.CARD_SCHEMA_V2 !== 'false';
 export class FeishuSenderAdapter implements IMessageSender {
   constructor(private sender: MessageSender) {}
 
-  async sendCard(chatId: string, state: CardState): Promise<string | undefined> {
-    return this.sender.sendCard(chatId, USE_V2 ? buildCardV2(state) : buildCard(state));
+  async sendCard(chatId: string, state: CardState, replyTo?: ReplyTarget): Promise<string | undefined> {
+    return this.sender.sendCard(chatId, USE_V2 ? buildCardV2(state) : buildCard(state), replyTo);
   }
 
   async updateCard(messageId: string, state: CardState): Promise<boolean> {
@@ -40,34 +40,34 @@ export class FeishuSenderAdapter implements IMessageSender {
    *
    * See memory: bug-feishu-v2-mobile-action-buttons.
    */
-  async sendQuestionCard(chatId: string, state: CardState): Promise<string | undefined> {
-    return this.sender.sendCard(chatId, buildCard(state));
+  async sendQuestionCard(chatId: string, state: CardState, replyTo?: ReplyTarget): Promise<string | undefined> {
+    return this.sender.sendCard(chatId, buildCard(state), replyTo);
   }
 
   async updateQuestionCard(messageId: string, state: CardState): Promise<boolean> {
     return this.sender.updateCard(messageId, buildCard(state));
   }
 
-  async sendTextNotice(chatId: string, title: string, content: string, color: string = 'blue'): Promise<void> {
-    await this.sender.sendCard(chatId, USE_V2 ? buildTextCardV2(title, content, color) : buildTextCard(title, content, color));
+  async sendTextNotice(chatId: string, title: string, content: string, color: string = 'blue', replyTo?: ReplyTarget): Promise<void> {
+    await this.sender.sendCard(chatId, USE_V2 ? buildTextCardV2(title, content, color) : buildTextCard(title, content, color), replyTo);
   }
 
-  async sendText(chatId: string, text: string): Promise<void> {
-    return this.sender.sendText(chatId, text);
+  async sendText(chatId: string, text: string, replyToMessageId?: string): Promise<void> {
+    return this.sender.sendText(chatId, text, replyToMessageId);
   }
 
-  async sendImageFile(chatId: string, filePath: string): Promise<boolean> {
-    return this.sender.sendImageFile(chatId, filePath);
+  async sendImageFile(chatId: string, filePath: string, replyTo?: ReplyTarget): Promise<boolean> {
+    return this.sender.sendImageFile(chatId, filePath, replyTo);
   }
 
-  async sendLocalFile(chatId: string, filePath: string, fileName: string): Promise<boolean> {
+  async sendLocalFile(chatId: string, filePath: string, fileName: string, replyTo?: ReplyTarget): Promise<boolean> {
     const ext = path.extname(fileName).toLowerCase();
     const feishuType = OutputsManager.feishuFileType(ext);
-    return this.sender.sendLocalFile(chatId, filePath, fileName, feishuType);
+    return this.sender.sendLocalFile(chatId, filePath, fileName, feishuType, replyTo);
   }
 
-  async sendAudioFile(chatId: string, filePath: string, fileName?: string): Promise<boolean> {
-    return this.sender.sendAudioFile(chatId, filePath, fileName ?? path.basename(filePath));
+  async sendAudioFile(chatId: string, filePath: string, fileName?: string, replyTo?: ReplyTarget): Promise<boolean> {
+    return this.sender.sendAudioFile(chatId, filePath, fileName ?? path.basename(filePath), replyTo);
   }
 
   async downloadImage(messageId: string, imageKey: string, savePath: string): Promise<boolean> {
