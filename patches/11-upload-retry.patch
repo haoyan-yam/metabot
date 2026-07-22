@@ -1,0 +1,136 @@
+diff --git a/src/feishu/message-sender.ts b/src/feishu/message-sender.ts
+index f218703..ff01dcd 100644
+--- a/src/feishu/message-sender.ts
++++ b/src/feishu/message-sender.ts
+@@ -45,6 +45,31 @@ export function redactSensitive(text: string): string {
+   return out;
+ }
+ 
++// [本地私改·patch K] 飞书上传偶发 502 / 请求 hang 会静默丢文件（uploadFile/uploadImage 原本
++// 只发一次、一 catch 就返回 undefined、不重试）——2026-07-07 与 2026-07-22 两个客户群
++// PPT 各因 502 静默丢失。这里给上传加「单次超时 + 对 transient 错(5xx/超时/网络)指数退避重试」。
++// 卡片发送早有重试(sendFinalCardWithRetry)，文件上传一直没有；本补丁补齐这个不对称。
++const UPLOAD_MAX_ATTEMPTS = 3;
++const UPLOAD_BASE_DELAY_MS = 1000;          // 退避基数：1s → 2s
++const UPLOAD_ATTEMPT_TIMEOUT_MS = 120_000;  // 单次尝试上限 2 分钟，避免像那次 hang 8 分钟
++
++function isTransientUploadError(err: unknown): boolean {
++  const e = err as { code?: string; status?: number; message?: string; response?: { status?: number } };
++  const status = e?.response?.status ?? e?.status;
++  if (typeof status === 'number' && status >= 500 && status < 600) return true;
++  if (['ETIMEDOUT', 'ECONNRESET', 'ECONNABORTED', 'EPIPE', 'ENETUNREACH', 'EAI_AGAIN'].includes(String(e?.code || ''))) return true;
++  return /\b(50[0-9]|timeout|timed out|socket hang up|network)\b/i.test(String(e?.message || ''));
++}
++
++async function withUploadTimeout<T>(p: Promise<T>, label: string): Promise<T> {
++  let timer: ReturnType<typeof setTimeout> | undefined;
++  const timeout = new Promise<never>((_, reject) => {
++    timer = setTimeout(() => reject(new Error(`${label} timed out after ${UPLOAD_ATTEMPT_TIMEOUT_MS}ms`)), UPLOAD_ATTEMPT_TIMEOUT_MS);
++  });
++  try { return await Promise.race([p, timeout]); }
++  finally { if (timer) clearTimeout(timer); }
++}
++
+ export class MessageSender {
+   constructor(
+     private client: lark.Client,
+@@ -160,22 +185,34 @@ export class MessageSender {
+   }
+ 
+   async uploadImage(filePath: string): Promise<string | undefined> {
+-    try {
+-      const resp = await this.client.im.v1.image.create({
+-        data: {
+-          image_type: 'message',
+-          image: fs.createReadStream(filePath),
+-        },
+-      });
+-      const imageKey = resp?.image_key;
+-      if (imageKey) {
+-        this.logger.info({ filePath, imageKey }, 'Image uploaded to Feishu');
++    // [本地私改·patch K] 同 uploadFile：单次超时 + transient 退避重试。
++    for (let attempt = 1; attempt <= UPLOAD_MAX_ATTEMPTS; attempt++) {
++      try {
++        const resp = await withUploadTimeout(this.client.im.v1.image.create({
++          data: {
++            image_type: 'message',
++            image: fs.createReadStream(filePath),
++          },
++        }), 'image upload');
++        const imageKey = resp?.image_key;
++        if (imageKey) {
++          this.logger.info({ filePath, imageKey, attempt }, 'Image uploaded to Feishu');
++          return imageKey;
++        }
++        this.logger.error({ filePath, attempt }, 'Image upload returned no image_key');
++        return undefined;
++      } catch (err) {
++        if (isTransientUploadError(err) && attempt < UPLOAD_MAX_ATTEMPTS) {
++          const delay = UPLOAD_BASE_DELAY_MS * 2 ** (attempt - 1);
++          this.logger.warn({ err, filePath, attempt, delay }, 'Image upload failed (transient), retrying');
++          await new Promise((r) => setTimeout(r, delay));
++          continue;
++        }
++        this.logger.error({ err, filePath, attempts: attempt }, 'Failed to upload image');
++        return undefined;
+       }
+-      return imageKey;
+-    } catch (err) {
+-      this.logger.error({ err, filePath }, 'Failed to upload image');
+-      return undefined;
+     }
++    return undefined;
+   }
+ 
+   async sendImage(chatId: string, imageKey: string, replyTo?: ReplyTarget): Promise<boolean> {
+@@ -204,23 +241,35 @@ export class MessageSender {
+   }
+ 
+   async uploadFile(filePath: string, fileName: string, fileType: string): Promise<string | undefined> {
+-    try {
+-      const resp = await this.client.im.v1.file.create({
+-        data: {
+-          file_type: fileType as any,
+-          file_name: fileName,
+-          file: fs.createReadStream(filePath),
+-        },
+-      });
+-      const fileKey = resp?.file_key;
+-      if (fileKey) {
+-        this.logger.info({ filePath, fileKey, fileType }, 'File uploaded to Feishu');
++    // [本地私改·patch K] 单次超时 + transient 错(5xx/超时/网络)指数退避重试；每次都新建 read stream。
++    for (let attempt = 1; attempt <= UPLOAD_MAX_ATTEMPTS; attempt++) {
++      try {
++        const resp = await withUploadTimeout(this.client.im.v1.file.create({
++          data: {
++            file_type: fileType as any,
++            file_name: fileName,
++            file: fs.createReadStream(filePath),
++          },
++        }), 'file upload');
++        const fileKey = resp?.file_key;
++        if (fileKey) {
++          this.logger.info({ filePath, fileKey, fileType, attempt }, 'File uploaded to Feishu');
++          return fileKey;
++        }
++        this.logger.error({ filePath, fileType, attempt }, 'File upload returned no file_key');
++        return undefined; // 非异常但没拿到 key：不重试
++      } catch (err) {
++        if (isTransientUploadError(err) && attempt < UPLOAD_MAX_ATTEMPTS) {
++          const delay = UPLOAD_BASE_DELAY_MS * 2 ** (attempt - 1);
++          this.logger.warn({ err, filePath, fileType, attempt, delay }, 'File upload failed (transient), retrying');
++          await new Promise((r) => setTimeout(r, delay));
++          continue;
++        }
++        this.logger.error({ err, filePath, fileType, attempts: attempt }, 'Failed to upload file');
++        return undefined;
+       }
+-      return fileKey;
+-    } catch (err) {
+-      this.logger.error({ err, filePath, fileType }, 'Failed to upload file');
+-      return undefined;
+     }
++    return undefined;
+   }
+ 
+   async sendFile(chatId: string, fileKey: string, replyTo?: ReplyTarget): Promise<boolean> {

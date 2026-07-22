@@ -1,0 +1,71 @@
+diff --git a/src/bridge/message-bridge.ts b/src/bridge/message-bridge.ts
+index 675765a..3a14c15 100644
+--- a/src/bridge/message-bridge.ts
++++ b/src/bridge/message-bridge.ts
+@@ -181,6 +181,12 @@ export class MessageBridge {
+   readonly costTracker: CostTracker;
+   private sessionRegistry?: SessionRegistry;
+   private runningTasks = new Map<string, RunningTask>(); // keyed by chatId
++  // [本地私改·patch F] 每个 chat「最近开始的那个任务」的发起人（open_id + chatType）。
++  // 在 executeQuery 任务开始时写入 = 任务归属人（与 patch H 注入同源），供「选择卡 @ 提问人」用。
++  // ⚠️ 绝不能在 handleMessage 里按【每条消息】写：任务跑的过程中别人插一句（会被排队）就会
++  //    覆盖它，导致选择卡 @ 错人。2026-07-20 某客户群实测：甲的任务弹选择卡却 @ 到了乙
++  //    （乙在任务进行中插了句话，把「最后发言人」覆盖成了他）。
++  private lastTaskRequester = new Map<string, { userId: string; chatType: string }>();
+   private messageQueues = new Map<string, IncomingMessage[]>(); // per-chatId message queue
+   private pendingBatches = new Map<string, PendingBatch>(); // media debounce batches
+   /**
+@@ -674,6 +680,25 @@ export class MessageBridge {
+     this.logger.debug({ chatId }, 'MessageBridge: attached executor subscriptions');
+   }
+ 
++  /**
++   * [本地私改·patch F] 新的 AskUserQuestion 选择卡出现时，@【本任务发起人】触发飞书强提醒，
++   * 免得用户没看到、5 分钟(QUESTION_TIMEOUT_MS)后被自动超时。仅群聊触发
++   * （私聊本就每条 bot 消息都推送，无需 @）。走独立文本消息（Feishu 文本 @ 推送最可靠）。
++   * 来源 lastTaskRequester 在 executeQuery 任务开始时写入 = 任务归属人，不是「最后发言人」。
++   */
++  private async atRequesterForQuestion(chatId: string): Promise<void> {
++    const r = this.lastTaskRequester.get(chatId);
++    if (!r || r.chatType !== 'group' || !r.userId) return;
++    try {
++      await this.sender.sendText(
++        chatId,
++        `<at user_id="${r.userId}"></at> 需要你选择一下 👆（${QUESTION_TIMEOUT_MS / 60000} 分钟内有效，逾时按默认处理）`,
++      );
++    } catch (err) {
++      this.logger.warn({ err, chatId }, '[patch F] failed to @ requester for question card');
++    }
++  }
++
+   /**
+    * Surface a between-turn AskUserQuestion as its own card on the chat.
+    * Called from the `between-turn-question` executor event. The user's
+@@ -771,6 +796,7 @@ export class MessageBridge {
+         : this.sender.sendCard.bind(this.sender);
+       try {
+         cardMessageId = await send(chatId, card);
++        if (cardMessageId) void this.atRequesterForQuestion(chatId); // [本地私改·patch F] @ 提问人
+       } catch (err) {
+         this.logger.error({ err, chatId, toolUseId: payload.toolUseId }, 'MessageBridge: failed to send between-turn question card');
+         return;
+@@ -1909,6 +1935,11 @@ export class MessageBridge {
+ 
+   private async executeQuery(msg: IncomingMessage): Promise<void> {
+     const { userId, chatId, text, imageKey, fileKey, fileName, messageId: msgId, chatType } = msg;
++
++    // [本地私改·patch F] 任务开始即记下发起人 = 本任务归属人。选择卡 @ 提问人时读它；
++    // 任务跑的过程中别人插话（会被排队、走别的路径）不会覆盖它，@ 的始终是发起本任务的人。
++    this.lastTaskRequester.set(chatId, { userId, chatType });
++
+     const { session, engineName } = this.prepareSessionForExecution(chatId);
+     const cwd = session.workingDirectory;
+     const abortController = new AbortController();
+@@ -2204,6 +2235,7 @@ export class MessageBridge {
+             const qMsgId = await sendQ(chatId, questionCardState);
+             if (qMsgId) {
+               runningTask.questionCardMessageId = qMsgId;
++              void this.atRequesterForQuestion(chatId); // [本地私改·patch F] @ 提问人
+             } else {
+               // Sender refused. Fall back to the legacy in-card render so the
+               // user still sees the question (even if mobile renders without

@@ -1,0 +1,26 @@
+diff --git a/src/bridge/message-bridge.ts b/src/bridge/message-bridge.ts
+--- a/src/bridge/message-bridge.ts
++++ b/src/bridge/message-bridge.ts
+@@ -2050,6 +2050,22 @@
+         });
+       }
+     };
++
++    // [本地私改·patch H] 把「本条消息是谁发的」注入本回合 prompt —— 桥接原本
++    // 只把 sender open_id 用于审计/去重/@提醒，从不喂给模型，bot 要给「提问人」
++    // 发文档权限时只能翻聊天记录猜人、容易错授（实测曾错授过人）。注入 prompt 而非
++    // system prompt append：persistent 模式的 system prompt 在 executor 生命周期内
++    // 固定（会把首回合提问人冻结到整个长会话），且 prompt 注入天然覆盖
++    // claude/kimi/codex 三引擎的每一个回合。API 路径（runApiTask）不经过本函数。
++    if (userId) {
++      prompt =
++        `<system-reminder>\n` +
++        `本条消息的发送者（提问人）open_id: ${userId}\n` +
++        `给提问人授予文档编辑权限、@ 提问人时直接用这个 open_id，无需用 lark-cli 翻聊天记录反查。` +
++        `涉及授权时仍须先校验该 open_id 在当前群成员名单内。\n` +
++        `</system-reminder>\n\n` +
++        prompt;
++    }
+ 
+     // One-shot restart reminder: if the bridge was just restarted (breadcrumb
+     // from `metabot restart/update`), prepend a system-reminder to this chat's

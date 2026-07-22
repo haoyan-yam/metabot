@@ -1,0 +1,135 @@
+diff --git a/src/bridge/notification-policy.ts b/src/bridge/notification-policy.ts
+--- a/src/bridge/notification-policy.ts
++++ b/src/bridge/notification-policy.ts
+@@ -24,18 +24,26 @@
+    * above). Private chats pass undefined and get a plain notice as before.
+    */
+   replyToMessageId?: string;
++  /**
++   * [本地私改·patch J] 话题任务的完成通知：话题内回复的推送很弱（不像主聊天
++   * 引用回复自带「回复了你」提醒），所以 (1) 文本前 @ 任务发起人做强提醒，
++   * (2) 不受 10s 免打扰门槛限制——话题里的活不论长短，干完都要叫到人。
++   * 主聊天/私聊不传，行为不变。
++   */
++  threadNotice?: { atUserId: string };
+ }): Promise<void> {
+-  const { sender, config, logger, chatId, state, durationMs, replyToMessageId } = opts;
++  const { sender, config, logger, chatId, state, durationMs, replyToMessageId, threadNotice } = opts;
+ 
+   if (sender.skipCompletionNotice) return;
+   if (state.status === 'complete' && isVoiceReplyEnabled(config)) return;
+-  if (durationMs < COMPLETION_NOTICE_MIN_DURATION_MS) return;
++  if (durationMs < COMPLETION_NOTICE_MIN_DURATION_MS && !threadNotice) return;
+ 
+   const statusEmoji = state.status === 'complete' ? '✅' : '❌';
+   const statusWord = state.status === 'complete' ? 'Done' : 'Failed';
++  const atPrefix = threadNotice ? `<at user_id="${threadNotice.atUserId}"></at> ` : '';
+ 
+   try {
+-    await sender.sendText(chatId, `${statusEmoji} ${statusWord}`, replyToMessageId);
++    await sender.sendText(chatId, `${atPrefix}${statusEmoji} ${statusWord}`, replyToMessageId);
+   } catch (err) {
+     logger.warn({ err, chatId }, 'Failed to send completion notice');
+   }
+diff --git a/src/bridge/message-bridge.ts b/src/bridge/message-bridge.ts
+--- a/src/bridge/message-bridge.ts
++++ b/src/bridge/message-bridge.ts
+@@ -2467,6 +2467,8 @@
+         // [本地私改] 仅群聊:完成通知作为「引用回复」发到触发消息上,让提问人
+         // 在答案就绪时才被通知(而不是开始思考时)。私聊传 undefined,行为不变。
+         replyToMessageId: chatType === 'group' ? msgId : undefined,
++        // [本地私改·patch J] 话题任务:通知里 @ 发起人且不受 10s 门槛限制
++        threadNotice: msg.threadId ? { atUserId: userId } : undefined,
+       });
+ 
+       // Send any output files produced by Claude
+@@ -2538,6 +2540,8 @@
+             durationMs,
+             // [本地私改] 仅群聊:完成通知作为引用回复,通知落在答案就绪时(见另一处同款注释)
+             replyToMessageId: chatType === 'group' ? msgId : undefined,
++            // [本地私改·patch J] 话题任务:通知里 @ 发起人且不受 10s 门槛限制
++            threadNotice: msg.threadId ? { atUserId: userId } : undefined,
+           });
+           await this.outputHandler.sendOutputFiles(chatId, outputsDir, processor, lastState, this.replyTargetFor(chatId)); // [本地私改·patch I]
+           return; // skip the normal error handling below
+diff --git a/tests/notification-policy.test.ts b/tests/notification-policy.test.ts
+--- a/tests/notification-policy.test.ts
++++ b/tests/notification-policy.test.ts
+@@ -124,6 +124,77 @@
+     expect(sender.sendText).toHaveBeenCalledWith('chat', '❌ Failed', undefined);
+   });
+ 
++  // [本地私改·patch J] 话题任务：完成通知 @ 发起人，且不受 10s 免打扰门槛限制。
++  it('thread tasks get the notice with an @-mention even under 10s (patch J)', async () => {
++    const sender = makeSender();
++    await sendCompletionNotice({
++      sender,
++      config: makeConfig(),
++      logger: { warn: vi.fn() } as any,
++      chatId: 'chat',
++      state: makeState('complete'),
++      durationMs: 1_000,
++      replyToMessageId: 'om_trigger',
++      threadNotice: { atUserId: 'ou_requester' },
++    });
++
++    expect(sender.sendText).toHaveBeenCalledWith(
++      'chat',
++      '<at user_id="ou_requester"></at> ✅ Done',
++      'om_trigger',
++    );
++  });
++
++  it('thread tasks over 10s also carry the @-mention (patch J)', async () => {
++    const sender = makeSender();
++    await sendCompletionNotice({
++      sender,
++      config: makeConfig(),
++      logger: { warn: vi.fn() } as any,
++      chatId: 'chat',
++      state: makeState('error'),
++      durationMs: 60_000,
++      replyToMessageId: 'om_trigger',
++      threadNotice: { atUserId: 'ou_requester' },
++    });
++
++    expect(sender.sendText).toHaveBeenCalledWith(
++      'chat',
++      '<at user_id="ou_requester"></at> ❌ Failed',
++      'om_trigger',
++    );
++  });
++
++  it('non-thread short tasks are still skipped (patch J regression)', async () => {
++    const sender = makeSender();
++    await sendCompletionNotice({
++      sender,
++      config: makeConfig(),
++      logger: { warn: vi.fn() } as any,
++      chatId: 'chat',
++      state: makeState('complete'),
++      durationMs: 9_999,
++      replyToMessageId: 'om_trigger',
++    });
++
++    expect(sender.sendText).not.toHaveBeenCalled();
++  });
++
++  it('voice-reply bots still skip the notice for successful thread tasks (patch J keeps the voice gate)', async () => {
++    const sender = makeSender();
++    await sendCompletionNotice({
++      sender,
++      config: makeConfig({ voiceReply: { enabled: true } }),
++      logger: { warn: vi.fn() } as any,
++      chatId: 'chat',
++      state: makeState('complete'),
++      durationMs: 60_000,
++      threadNotice: { atUserId: 'ou_requester' },
++    });
++
++    expect(sender.sendText).not.toHaveBeenCalled();
++  });
++
+   it('logs and swallows send failures', async () => {
+     const logger = { warn: vi.fn() };
+     const sender = makeSender({ sendText: vi.fn().mockRejectedValue(new Error('nope')) });

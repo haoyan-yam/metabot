@@ -1,0 +1,121 @@
+diff --git a/src/bridge/message-sender.interface.ts b/src/bridge/message-sender.interface.ts
+--- a/src/bridge/message-sender.interface.ts
++++ b/src/bridge/message-sender.interface.ts
+@@ -37,8 +37,16 @@
+   /** Send a simple notice message (for command responses: /help, /reset, /stop, etc.). */
+   sendTextNotice(chatId: string, title: string, content: string, color?: string): Promise<void>;
+ 
+-  /** Send a plain text message. */
+-  sendText(chatId: string, text: string): Promise<void>;
++  /**
++   * Send a plain text message.
++   *
++   * `replyToMessageId` (optional, [本地私改]): when set, the text is sent as a
++   * quote-reply to that message so the person who triggered it gets a reply
++   * notification. Used by the task-completion notice so the ping lands when the
++   * answer is ready (not when the bot starts thinking). Platforms without a
++   * reply concept ignore the arg and send normally.
++   */
++  sendText(chatId: string, text: string, replyToMessageId?: string): Promise<void>;
+ 
+   /** Send a local image file to the chat. */
+   sendImageFile(chatId: string, filePath: string): Promise<boolean>;
+diff --git a/src/feishu/feishu-sender-adapter.ts b/src/feishu/feishu-sender-adapter.ts
+--- a/src/feishu/feishu-sender-adapter.ts
++++ b/src/feishu/feishu-sender-adapter.ts
+@@ -52,8 +52,8 @@
+     await this.sender.sendCard(chatId, USE_V2 ? buildTextCardV2(title, content, color) : buildTextCard(title, content, color));
+   }
+ 
+-  async sendText(chatId: string, text: string): Promise<void> {
+-    return this.sender.sendText(chatId, text);
++  async sendText(chatId: string, text: string, replyToMessageId?: string): Promise<void> {
++    return this.sender.sendText(chatId, text, replyToMessageId);
+   }
+ 
+   async sendImageFile(chatId: string, filePath: string): Promise<boolean> {
+diff --git a/src/feishu/message-sender.ts b/src/feishu/message-sender.ts
+--- a/src/feishu/message-sender.ts
++++ b/src/feishu/message-sender.ts
+@@ -205,7 +205,20 @@
+     }
+   }
+ 
+-  async sendText(chatId: string, text: string): Promise<void> {
++  async sendText(chatId: string, text: string, replyToMessageId?: string): Promise<void> {
++    // [本地私改] 传了 replyToMessageId 就用 im.message.reply 引用回复(触发提问人的飞书通知);
++    // reply 失败(原消息被撤回/过期/权限等)则回退普通 create,保证通知即使引用失败也照发。
++    if (replyToMessageId) {
++      try {
++        await this.client.im.v1.message.reply({
++          path: { message_id: replyToMessageId },
++          data: { content: JSON.stringify({ text }), msg_type: 'text' },
++        });
++        return;
++      } catch (err) {
++        this.logger.warn({ err, replyToMessageId }, 'Failed to reply-quote text, falling back to plain send');
++      }
++    }
+     try {
+       await this.client.im.v1.message.create({
+         params: { receive_id_type: 'chat_id' },
+diff --git a/src/bridge/notification-policy.ts b/src/bridge/notification-policy.ts
+--- a/src/bridge/notification-policy.ts
++++ b/src/bridge/notification-policy.ts
+@@ -17,8 +17,15 @@
+   chatId: string;
+   state: CardState;
+   durationMs: number;
++  /**
++   * [本地私改] When set (group chats), the completion notice is sent as a
++   * quote-reply to the triggering message, so the asker's Feishu push lands
++   * exactly when the answer is ready (the rich answer is already in the card
++   * above). Private chats pass undefined and get a plain notice as before.
++   */
++  replyToMessageId?: string;
+ }): Promise<void> {
+-  const { sender, config, logger, chatId, state, durationMs } = opts;
++  const { sender, config, logger, chatId, state, durationMs, replyToMessageId } = opts;
+ 
+   if (sender.skipCompletionNotice) return;
+   if (state.status === 'complete' && isVoiceReplyEnabled(config)) return;
+@@ -28,7 +35,7 @@
+   const statusWord = state.status === 'complete' ? 'Done' : 'Failed';
+ 
+   try {
+-    await sender.sendText(chatId, `${statusEmoji} ${statusWord}`);
++    await sender.sendText(chatId, `${statusEmoji} ${statusWord}`, replyToMessageId);
+   } catch (err) {
+     logger.warn({ err, chatId }, 'Failed to send completion notice');
+   }
+diff --git a/src/bridge/message-bridge.ts b/src/bridge/message-bridge.ts
+--- a/src/bridge/message-bridge.ts
++++ b/src/bridge/message-bridge.ts
+@@ -1908,7 +1908,7 @@
+   }
+ 
+   private async executeQuery(msg: IncomingMessage): Promise<void> {
+-    const { userId, chatId, text, imageKey, fileKey, fileName, messageId: msgId } = msg;
++    const { userId, chatId, text, imageKey, fileKey, fileName, messageId: msgId, chatType } = msg;
+     const { session, engineName } = this.prepareSessionForExecution(chatId);
+     const cwd = session.workingDirectory;
+     const abortController = new AbortController();
+@@ -2382,6 +2382,9 @@
+         chatId,
+         state: lastState,
+         durationMs,
++        // [本地私改] 仅群聊:完成通知作为「引用回复」发到触发消息上,让提问人
++        // 在答案就绪时才被通知(而不是开始思考时)。私聊传 undefined,行为不变。
++        replyToMessageId: chatType === 'group' ? msgId : undefined,
+       });
+ 
+       // Send any output files produced by Claude
+@@ -2451,6 +2454,8 @@
+             chatId,
+             state: lastState,
+             durationMs,
++            // [本地私改] 仅群聊:完成通知作为引用回复,通知落在答案就绪时(见另一处同款注释)
++            replyToMessageId: chatType === 'group' ? msgId : undefined,
+           });
+           await this.outputHandler.sendOutputFiles(chatId, outputsDir, processor, lastState);
+           return; // skip the normal error handling below

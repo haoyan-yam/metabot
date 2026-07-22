@@ -1,0 +1,106 @@
+diff --git a/src/feishu/message-sender.ts b/src/feishu/message-sender.ts
+index 8720912..c0aae2e 100644
+--- a/src/feishu/message-sender.ts
++++ b/src/feishu/message-sender.ts
+@@ -2,6 +2,48 @@ import * as fs from 'node:fs';
+ import type * as lark from '@larksuiteoapi/node-sdk';
+ import type { Logger } from '../utils/logger.js';
+ 
++/**
++ * [本地私改·patch G] 出站脱敏：飞书对话里不透露本机真实路径与密钥。
++ *
++ * 背景：bot 跑在本机、有完整工具权限，解释自己做了什么时会很自然地把本机绝对
++ * 路径说出口——实测曾有 bot 在**客户群**里回过「成品归档到 ~/projects/<client>/
++ * outputs/，而桥接只监听系统指定的 outputs 目录」。光靠提示词约束依赖模型自觉、
++ * 不可靠，故在**出站收口处**强制过滤：MessageSender 的三个「带文字」出口
++ * （sendCard / updateCard / sendText）覆盖全部卡片与文本，模型绕不过去。
++ * 对所有会话（群聊 + 私聊）一律生效——私聊同样可能被截图/转发。
++ *
++ * ⚠️ 刻意**不做**「长 token 通杀」之类的宽泛规则：那会误伤飞书自身的
++ * open_id(`ou_…`)、file_key(`file_v3_…`)、image_key(`img_v3_…`)、message_id(`om_…`)，
++ * 直接打断 @ 提醒(patch F)与图片/文件发送。只匹配明确的路径与密钥形态。
++ * 上传/下载用的 filePath 走 sendImageFile/sendLocalFile/uploadFile，**不经过本函数**
++ * （否则真实路径被替换会导致读不到文件）。
++ *
++ * 替换串只含中文书名号，不含引号/反斜杠 → 不会破坏卡片的 JSON 结构。
++ */
++// 路径：前面加负向后顾，避免吃掉 URL 里的 /tmp/ 之类（如 https://host/tmp/x）
++const LOCAL_PATH_RE =
++  /(?<![A-Za-z0-9])(?:\/Users\/|~\/|\/var\/folders\/|\/private\/(?:tmp|var)\/|\/tmp\/)[^\s"'\\,;)\]}]*/g;
++
++// 密钥：仅匹配明确形态；KEY/TOKEN/SECRET 等键名限大写，避免误伤 file_key 等小写字段
++const SECRET_RULES: Array<[RegExp, string]> = [
++  [/\bsk-[A-Za-z0-9_-]{16,}/g, '〈已隐藏〉'],   // OpenAI 类
++  [/\bAKLT[A-Za-z0-9_-]{10,}/g, '〈已隐藏〉'],  // 火山 AK
++  [/\bmt_[A-Za-z0-9]{16,}/g, '〈已隐藏〉'],     // metabot-core token
++  [/\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)[A-Z0-9_]*)\s*[=:]\s*['"]?[^\s"'\\,;)\]}]+/g, '$1=〈已隐藏〉'],
++];
++
++/** [本地私改·patch G] 见上。对出站文字做脱敏；文件名（有扩展名）保留，只抹掉目录结构。 */
++export function redactSensitive(text: string): string {
++  let out = text;
++  for (const [re, to] of SECRET_RULES) out = out.replace(re, to);
++  out = out.replace(LOCAL_PATH_RE, (m) => {
++    const base = m.slice(m.lastIndexOf('/') + 1);
++    // 只在末段像文件名（有扩展名）时保留它；否则整段抹掉，避免 /Users/<用户名> 漏出账号名
++    return /\.[A-Za-z0-9]{1,8}$/.test(base) ? `〈本地路径〉/${base}` : '〈本地路径〉';
++  });
++  return out;
++}
++
+ export class MessageSender {
+   constructor(
+     private client: lark.Client,
+@@ -9,12 +51,13 @@ export class MessageSender {
+   ) {}
+ 
+   async sendCard(chatId: string, cardContent: string): Promise<string | undefined> {
++    const safeContent = redactSensitive(cardContent); // [本地私改·patch G] 出站脱敏
+     try {
+       const resp = await this.client.im.v1.message.create({
+         params: { receive_id_type: 'chat_id' },
+         data: {
+           receive_id: chatId,
+-          content: cardContent,
++          content: safeContent,
+           msg_type: 'interactive',
+         },
+       });
+@@ -31,10 +74,11 @@ export class MessageSender {
+   }
+ 
+   async updateCard(messageId: string, cardContent: string): Promise<boolean> {
++    const safeContent = redactSensitive(cardContent); // [本地私改·patch G] 出站脱敏
+     try {
+       await this.client.im.v1.message.patch({
+         path: { message_id: messageId },
+-        data: { content: cardContent },
++        data: { content: safeContent },
+       });
+       return true;
+     } catch (err) {
+@@ -206,13 +250,14 @@ export class MessageSender {
+   }
+ 
+   async sendText(chatId: string, text: string, replyToMessageId?: string): Promise<void> {
++    const safeText = redactSensitive(text); // [本地私改·patch G] 出站脱敏
+     // [本地私改] 传了 replyToMessageId 就用 im.message.reply 引用回复(触发提问人的飞书通知);
+     // reply 失败(原消息被撤回/过期/权限等)则回退普通 create,保证通知即使引用失败也照发。
+     if (replyToMessageId) {
+       try {
+         await this.client.im.v1.message.reply({
+           path: { message_id: replyToMessageId },
+-          data: { content: JSON.stringify({ text }), msg_type: 'text' },
++          data: { content: JSON.stringify({ text: safeText }), msg_type: 'text' },
+         });
+         return;
+       } catch (err) {
+@@ -224,7 +269,7 @@ export class MessageSender {
+         params: { receive_id_type: 'chat_id' },
+         data: {
+           receive_id: chatId,
+-          content: JSON.stringify({ text }),
++          content: JSON.stringify({ text: safeText }),
+           msg_type: 'text',
+         },
+       });

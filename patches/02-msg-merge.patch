@@ -1,0 +1,91 @@
+diff --git a/src/bridge/media-batch.ts b/src/bridge/media-batch.ts
+index ce8ead1..baaa195 100644
+--- a/src/bridge/media-batch.ts
++++ b/src/bridge/media-batch.ts
+@@ -44,3 +44,34 @@ export function mergeBatchWithText(batchMsgs: IncomingMessage[], textMsg: Incomi
+     })),
+   };
+ }
++
++/**
++ * Merge a follow-up message into an earlier queued message from the SAME
++ * sender. Used to coalesce a person's rapid-fire messages while a task is
++ * running, so they run as a single turn instead of N serial turns. The earlier
++ * message stays the base (keeping its primary media slot); the follow-up's text
++ * is appended and its media folded into extraMedia. Default media placeholder
++ * texts (e.g. "请分析这张图片") are dropped when there is real text to keep.
++ */
++export function mergeSameSenderMessages(base: IncomingMessage, next: IncomingMessage): IncomingMessage {
++  const texts: string[] = [];
++  if (base.text && !isDefaultMediaText(base)) texts.push(base.text);
++  if (next.text && !isDefaultMediaText(next)) texts.push(next.text);
++
++  const extraMedia = [...(base.extraMedia ?? [])];
++  if (next.imageKey || next.fileKey) {
++    extraMedia.push({
++      messageId: next.messageId,
++      imageKey: next.imageKey,
++      fileKey: next.fileKey,
++      fileName: next.fileName,
++    });
++  }
++  if (next.extraMedia?.length) extraMedia.push(...next.extraMedia);
++
++  return {
++    ...base,
++    text: texts.length > 0 ? texts.join('\n') : base.text,
++    extraMedia: extraMedia.length > 0 ? extraMedia : undefined,
++  };
++}
+diff --git a/src/utils/audit-logger.ts b/src/utils/audit-logger.ts
+index c8ecf9d..379d661 100644
+--- a/src/utils/audit-logger.ts
++++ b/src/utils/audit-logger.ts
+@@ -8,6 +8,7 @@ export type AuditEvent =
+   | 'task_idle_timeout'
+   | 'task_stopped'
+   | 'task_queued'
++  | 'task_queued_merged'
+   | 'queue_cleared'
+   | 'command'
+   | 'auth_denied'
+diff --git a/src/bridge/message-bridge.ts b/src/bridge/message-bridge.ts
+index 753cd53..08bd54f 100644
+--- a/src/bridge/message-bridge.ts
++++ b/src/bridge/message-bridge.ts
+@@ -44,7 +45,7 @@ import { CodexCommandController } from './codex-command-controller.js';
+ import { buildCodexGoalPrompt } from './codex-goal-policy.js';
+ import { isContextOverflowError, isStaleSessionError } from './error-classifiers.js';
+ import { sendFinalCardWithRetry, sendPlanContent } from './final-delivery.js';
+-import { isDefaultMediaText, mergeBatchMessages, mergeBatchWithText, type PendingBatch } from './media-batch.js';
++import { isDefaultMediaText, mergeBatchMessages, mergeBatchWithText, mergeSameSenderMessages, type PendingBatch } from './media-batch.js';
+ import { sendCompletionNotice } from './notification-policy.js';
+ import { normalizePromptForEngine } from './prompt-normalizer.js';
+ import { SlashPickerController } from './slash-picker-controller.js';
+@@ -1608,6 +1609,26 @@ export class MessageBridge {
+       }
+ 
+       const queue = this.messageQueues.get(chatId) || [];
++
++      // Coalesce rapid-fire messages from the same sender: if the tail of the
++      // queue is already this user's message, merge into it instead of taking
++      // another slot. Cross-user ordering is preserved (only the tail merges),
++      // and merging is allowed even at MAX_QUEUE_SIZE since it doesn't grow the
++      // queue — a user can still refine their pending message when full.
++      const tail = queue[queue.length - 1];
++      if (tail && tail.userId === msg.userId) {
++        queue[queue.length - 1] = mergeSameSenderMessages(tail, msg);
++        this.messageQueues.set(chatId, queue);
++        this.audit.log({ event: 'task_queued_merged', botName: this.config.name, chatId, userId: msg.userId, prompt: msg.text, meta: { position: queue.length } });
++        await this.sender.sendTextNotice(
++          chatId,
++          '📋 Merged',
++          `Added to your pending message (position #${queue.length}). Your messages will run together after the current task finishes.`,
++          'blue',
++        );
++        return;
++      }
++
+       if (queue.length >= MAX_QUEUE_SIZE) {
+         await this.sender.sendTextNotice(
+           chatId,
