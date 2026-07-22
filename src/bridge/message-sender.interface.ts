@@ -19,6 +19,20 @@ export interface ReplyTarget {
 }
 
 /**
+ * [本地私改·patch N] Download outcome for user-sent attachments.
+ *
+ * `true` = success. `false` = failure with no detail (legacy senders).
+ * `{ ok: false, reason }` = failure with a human-readable reason that the
+ * bridge MUST surface in the prompt — a silently dropped attachment looks to
+ * the agent like the user never sent one (real incidents: 100MB+ files on
+ * 2026-07-20/22 vanished without a trace).
+ *
+ * ⚠️ Check success with `result === true`, never truthiness — the failure
+ * object is truthy. Senders that only report boolean stay compatible.
+ */
+export type DownloadOutcome = boolean | { ok: false; reason: string };
+
+/**
  * Platform-agnostic message sender interface.
  * Implemented by each IM platform (Feishu, Telegram, etc.).
  */
@@ -78,11 +92,11 @@ export interface IMessageSender {
   /** Send a local audio file as a native voice/audio message, when supported. */
   sendAudioFile?(chatId: string, filePath: string, fileName?: string, replyTo?: ReplyTarget): Promise<boolean>;
 
-  /** Download a user-sent image to a local path. */
-  downloadImage(messageId: string, imageKey: string, savePath: string): Promise<boolean>;
+  /** Download a user-sent image to a local path. See DownloadOutcome ([本地私改·patch N]). */
+  downloadImage(messageId: string, imageKey: string, savePath: string): Promise<DownloadOutcome>;
 
-  /** Download a user-sent file to a local path. */
-  downloadFile(messageId: string, fileKey: string, savePath: string): Promise<boolean>;
+  /** Download a user-sent file to a local path. See DownloadOutcome ([本地私改·patch N]). */
+  downloadFile(messageId: string, fileKey: string, savePath: string): Promise<DownloadOutcome>;
 
   /** If true, the bridge will not send a separate "Task completed" text after the card update. */
   skipCompletionNotice?: boolean;

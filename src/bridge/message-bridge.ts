@@ -4,7 +4,7 @@ import * as path from 'node:path';
 import type { BotConfigBase } from '../config.js';
 import type { Logger } from '../utils/logger.js';
 import type { BackgroundEvent, IncomingMessage, CardState, PendingQuestion, TeamState, TeamMember, TeamTask } from '../types.js';
-import type { IMessageSender, ReplyTarget } from './message-sender.interface.js';
+import type { DownloadOutcome, IMessageSender, ReplyTarget } from './message-sender.interface.js';
 import type { DocSync } from '../sync/doc-sync.js';
 import type {
   Engine,
@@ -56,6 +56,11 @@ import { buildAgentTeamCardSnapshot } from '../agent-teams/card-snapshot.js';
 export { isContextOverflowError, isStaleSessionError } from './error-classifiers.js';
 export { normalizePromptForEngine } from './prompt-normalizer.js';
 export { extractSpontaneousSnippet, formatSpontaneousCardBody } from './spontaneous-activity.js';
+
+/** [本地私改·patch N] 提取下载失败原因；成功判定必须用 `=== true`（失败对象是 truthy 的）。 */
+function downloadFailReason(res: DownloadOutcome): string {
+  return typeof res === 'object' && !res.ok && res.reason ? res.reason : 'unknown error';
+}
 
 const TASK_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24 hours
 const QUESTION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes for user to answer
@@ -1985,53 +1990,68 @@ export class MessageBridge {
     fs.mkdirSync(downloadsDir, { recursive: true });
 
     // Handle image download if present
+    // [本地私改·patch N] 下载失败绝不静默：prompt 里写明文件名与原因，并要求 agent 告知用户。
+    // 真实事故：2026-07-20/22 两个 100MB+ 附件下载失败被吞，agent 表现得像用户从没发过文件。
+    // 注意 DownloadOutcome 的失败对象是 truthy 的，成功判定必须 === true。
     let prompt = enginePromptText;
     let imagePath: string | undefined;
     let filePath: string | undefined;
     if (imageKey) {
       imagePath = path.join(downloadsDir, `${imageKey}.png`);
-      const ok = await this.sender.downloadImage(msgId, imageKey, imagePath);
-      if (ok) {
+      const res = await this.sender.downloadImage(msgId, imageKey, imagePath);
+      if (res === true) {
         prompt = `${enginePromptText}\n\n[Image saved at: ${imagePath}]\nPlease use the Read tool to read and analyze this image file.`;
       } else {
-        prompt = `${enginePromptText}\n\n(Note: Failed to download the image)`;
+        const reason = downloadFailReason(res);
+        prompt = `${enginePromptText}\n\n(Note: The image attachment (key ${imageKey}) failed to download: ${reason}. Tell the user their image could not be retrieved and why.)`;
       }
     }
 
     // Handle file download if present
     if (fileKey && fileName) {
       filePath = path.join(downloadsDir, `${fileKey}_${fileName}`);
-      const ok = await this.sender.downloadFile(msgId, fileKey, filePath);
-      if (ok) {
+      const res = await this.sender.downloadFile(msgId, fileKey, filePath);
+      if (res === true) {
         prompt = `${enginePromptText}\n\n[File saved at: ${filePath}]\nPlease use the Read tool (for text/code files, images, PDFs) or Bash tool (for other formats) to read and analyze this file.`;
       } else {
-        prompt = `${enginePromptText}\n\n(Note: Failed to download the file)`;
+        const reason = downloadFailReason(res);
+        prompt = `${enginePromptText}\n\n(Note: The file attachment "${fileName}" failed to download: ${reason}. Tell the user their file could not be retrieved and why.)`;
       }
     }
 
     // Handle extra media from batched messages
     const extraPaths: string[] = [];
+    let extraMediaFailures = 0; // [本地私改·patch N]
     if (msg.extraMedia && msg.extraMedia.length > 0) {
       for (const media of msg.extraMedia) {
         if (media.imageKey) {
           const p = path.join(downloadsDir, `${media.imageKey}.png`);
-          const ok = await this.sender.downloadImage(media.messageId, media.imageKey, p);
-          if (ok) {
+          const res = await this.sender.downloadImage(media.messageId, media.imageKey, p);
+          if (res === true) {
             extraPaths.push(p);
             prompt += `\n[Image saved at: ${p}]`;
+          } else {
+            extraMediaFailures++;
+            prompt += `\n[Image attachment (key ${media.imageKey}) failed to download: ${downloadFailReason(res)}]`;
           }
         }
         if (media.fileKey && media.fileName) {
           const p = path.join(downloadsDir, `${media.fileKey}_${media.fileName}`);
-          const ok = await this.sender.downloadFile(media.messageId, media.fileKey, p);
-          if (ok) {
+          const res = await this.sender.downloadFile(media.messageId, media.fileKey, p);
+          if (res === true) {
             extraPaths.push(p);
             prompt += `\n[File saved at: ${p}]`;
+          } else {
+            extraMediaFailures++;
+            prompt += `\n[File attachment "${media.fileName}" failed to download: ${downloadFailReason(res)}]`;
           }
         }
       }
       if (extraPaths.length > 0) {
         prompt += '\nPlease use the Read tool to analyze all the above files.';
+      }
+      if (extraMediaFailures > 0) {
+        prompt += '\nTell the user which attachments failed to download and why.';
       }
     }
 

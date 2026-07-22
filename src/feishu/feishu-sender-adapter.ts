@@ -1,5 +1,5 @@
 import * as path from 'node:path';
-import type { IMessageSender, ReplyTarget } from '../bridge/message-sender.interface.js';
+import type { DownloadOutcome, IMessageSender, ReplyTarget } from '../bridge/message-sender.interface.js';
 import type { CardState } from '../types.js';
 import { MessageSender } from './message-sender.js';
 import { buildCard, buildTextCard } from './card-builder.js';
@@ -70,11 +70,11 @@ export class FeishuSenderAdapter implements IMessageSender {
     return this.sender.sendAudioFile(chatId, filePath, fileName ?? path.basename(filePath), replyTo);
   }
 
-  async downloadImage(messageId: string, imageKey: string, savePath: string): Promise<boolean> {
+  async downloadImage(messageId: string, imageKey: string, savePath: string): Promise<DownloadOutcome> {
     return this.sender.downloadImage(messageId, imageKey, savePath);
   }
 
-  async downloadFile(messageId: string, fileKey: string, savePath: string): Promise<boolean> {
+  async downloadFile(messageId: string, fileKey: string, savePath: string): Promise<DownloadOutcome> {
     return this.sender.downloadFile(messageId, fileKey, savePath);
   }
 }

@@ -26,7 +26,12 @@ const memberCountCache = new Map<string, { count: number; ts: number }>();
 
 // Cache for recent media messages in group chats (file/image sent without @mention).
 // When a user later @mentions the bot, cached media is attached automatically.
-const MEDIA_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+// [本地私改·patch N] TTL 5 分钟太短：2026-07-21 13:29 缓存的两个文件，13:39 @bot 时
+// 已过期被【静默】过滤，用户以为 bot 收到了文件。传大文件、写一段说明再 @，超过
+// 5 分钟太常见。提到 30 分钟（缓存只存 key 不存内容，内存无压力）；过期丢弃必须打
+// WARN（含文件名），事后可从日志还原「用户发过什么、为什么没带上」。
+// 导出 cachePendingMedia/getCachedMedia/MEDIA_CACHE_TTL_MS 仅为单测；生产只有本文件用。
+export const MEDIA_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 interface CachedMedia {
   messageId: string;
   imageKey?: string;
@@ -40,12 +45,34 @@ function cacheMediaKey(chatId: string, userId: string): string {
   return `${chatId}:${userId}`;
 }
 
-function getCachedMedia(chatId: string, userId: string): CachedMedia[] {
+/** [本地私改·patch N] 入缓存收口成函数（原是调用点内联三行），单测得以直接构造过期条目。 */
+export function cachePendingMedia(chatId: string, userId: string, media: CachedMedia): void {
+  const key = cacheMediaKey(chatId, userId);
+  const items = pendingMediaCache.get(key) || [];
+  items.push(media);
+  pendingMediaCache.set(key, items);
+}
+
+export function getCachedMedia(chatId: string, userId: string, logger?: Logger): CachedMedia[] {
   const key = cacheMediaKey(chatId, userId);
   const items = pendingMediaCache.get(key);
   if (!items) return [];
   const now = Date.now();
   const valid = items.filter(m => now - m.ts < MEDIA_CACHE_TTL_MS);
+  // [本地私改·patch N] 过期丢弃绝不静默：WARN 带文件名/图片 key 与滞留时长
+  const expired = items.filter(m => now - m.ts >= MEDIA_CACHE_TTL_MS);
+  if (expired.length > 0 && logger) {
+    logger.warn(
+      {
+        chatId,
+        userId,
+        dropped: expired.map(m => m.fileName || m.imageKey || m.fileKey || m.messageId),
+        oldestAgeMs: Math.max(...expired.map(m => now - m.ts)),
+        ttlMs: MEDIA_CACHE_TTL_MS,
+      },
+      'Cached media expired before @mention and was dropped (NOT attached to the task)',
+    );
+  }
   if (valid.length === 0) {
     pendingMediaCache.delete(key);
     return [];
@@ -205,10 +232,7 @@ export function createEventDispatcher(
               // Cache media messages for later retrieval when user @mentions bot
               const media = parseMediaMessage(message, msgType, logger);
               if (media) {
-                const key = cacheMediaKey(chatId, userId);
-                const items = pendingMediaCache.get(key) || [];
-                items.push({ ...media, messageId, ts: Date.now() });
-                pendingMediaCache.set(key, items);
+                cachePendingMedia(chatId, userId, { ...media, messageId, ts: Date.now() });
                 logger.info({ chatId, userId, msgType, ...media }, 'Cached group media for later @mention');
               }
               return;
@@ -314,7 +338,7 @@ export function createEventDispatcher(
           logger.info({ chatId, postExtraImageCount: postExtraImages.length }, 'Attached extra images from post');
         }
         if (chatType === 'group') {
-          const cached = getCachedMedia(chatId, userId);
+          const cached = getCachedMedia(chatId, userId, logger); // [本地私改·patch N] 过期丢弃要打 WARN
           if (cached.length > 0) {
             const cachedMedia = cached.map(m => ({
               messageId: m.messageId,

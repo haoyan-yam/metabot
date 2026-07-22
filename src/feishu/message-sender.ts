@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import type * as lark from '@larksuiteoapi/node-sdk';
 import type { Logger } from '../utils/logger.js';
-import type { ReplyTarget } from '../bridge/message-sender.interface.js';
+import type { DownloadOutcome, ReplyTarget } from '../bridge/message-sender.interface.js';
 
 /**
  * [本地私改·patch G] 出站脱敏：飞书对话里不透露本机真实路径与密钥。
@@ -68,6 +68,98 @@ async function withUploadTimeout<T>(p: Promise<T>, label: string): Promise<T> {
   });
   try { return await Promise.race([p, timeout]); }
   finally { if (timer) clearTimeout(timer); }
+}
+
+/**
+ * [本地私改·patch N] 超 100MB 附件的分片下载回退。
+ *
+ * 背景：SDK 的 im.v1.messageResource.get 是单次 GET，飞书对它限 100MB——超限返回
+ * HTTP 400 + body {code:234037}。2026-07-20（225MB）与 07-22（152.9MB）两次真实失败，
+ * 且失败被静默吞掉，agent 全然不知道用户发过文件。同端点其实支持 HTTP Range 分段：
+ * lark-cli 的 +messages-resources-download 就是靠「128KB 探测段（从 Content-Range 拿
+ * 总大小）→ 8MB 顺序分段 → 尺寸校验」下载成功了同一条 225.3MB 消息（约 2.5 分钟）。
+ * 这里按同一协议自实现，不 spawn lark-cli（免去对 profile 配置的耦合）。
+ *
+ * 实现要点：
+ * - 走 client.request()：每个分段请求都由 SDK 注入新鲜 tenant token——下载耗时可达
+ *   数分钟，固定 token 可能中途过期。`$return_headers` 让拦截器把 headers 带回来。
+ * - 错误响应因 responseType:'stream' 是【未消费的流】，要先读完才能解析出 code。
+ * - 每段 90s 超时 + transient 错误重试 2 次（指数退避）；整体 30 分钟兜底止损。
+ * - 任何一步失败都删掉半成品文件，绝不留下截断的假文件。
+ */
+const LARGE_FILE_ERR_CODE = 234037;           // 飞书：单次 GET 资源超 100MB
+const CHUNK_PROBE_BYTES = 128 * 1024;         // 探测段 128KB（与 lark-cli 一致）
+const CHUNK_BYTES = 8 * 1024 * 1024;          // 后续分段 8MB（与 lark-cli 一致）
+const CHUNK_MAX_ATTEMPTS = 3;                 // 每段 1 次 + 重试 2 次
+const CHUNK_RETRY_BASE_DELAY_MS = 1000;       // 退避基数 1s → 2s
+const CHUNK_ATTEMPT_TIMEOUT_MS = 90_000;      // 单段超时（8MB 实测约 5s，留 ~17x 余量）
+const CHUNK_TOTAL_DEADLINE_MS = 30 * 60_000;  // 整体兜底（225MB 实测约 2.5 分钟）
+const ERROR_BODY_READ_LIMIT = 64 * 1024;      // 错误体最多读 64KB，防异常大响应
+const ERROR_BODY_READ_TIMEOUT_MS = 5000;
+
+function isTransientDownloadError(err: unknown): boolean {
+  const e = err as { code?: string; status?: number; message?: string; response?: { status?: number } };
+  const status = e?.response?.status ?? e?.status;
+  if (typeof status === 'number' && status >= 500 && status < 600) return true;
+  if (['ETIMEDOUT', 'ECONNRESET', 'ECONNABORTED', 'EPIPE', 'ENETUNREACH', 'EAI_AGAIN'].includes(String(e?.code || ''))) return true;
+  return /\b(50[0-9]|timeout|timed out|socket hang up|network)\b/i.test(String(e?.message || ''));
+}
+
+/** 把 responseType:'stream' 的错误响应体读成字符串（可能已是 Buffer/string/object）。 */
+async function readErrorBody(data: unknown): Promise<string | undefined> {
+  if (data == null) return undefined;
+  if (Buffer.isBuffer(data)) return data.toString('utf8');
+  if (typeof data === 'string') return data;
+  const maybeStream = data as NodeJS.ReadableStream & { destroy?: () => void };
+  if (typeof maybeStream.on === 'function') {
+    return await new Promise<string | undefined>((resolve) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      const timer = setTimeout(() => { maybeStream.destroy?.(); resolve(undefined); }, ERROR_BODY_READ_TIMEOUT_MS);
+      maybeStream.on('data', (c: Buffer | string) => {
+        if (size < ERROR_BODY_READ_LIMIT) {
+          const buf = Buffer.from(c);
+          chunks.push(buf);
+          size += buf.length;
+        }
+      });
+      maybeStream.on('end', () => { clearTimeout(timer); resolve(Buffer.concat(chunks).toString('utf8')); });
+      maybeStream.on('error', () => { clearTimeout(timer); resolve(undefined); });
+    });
+  }
+  try { return JSON.stringify(data); } catch { return undefined; }
+}
+
+/** 从 axios/SDK 抛出的下载错误里解析飞书业务错误码（拿不到则两项皆 undefined）。 */
+async function extractFeishuErrorCode(err: unknown): Promise<{ code?: number; msg?: string }> {
+  const data = (err as { response?: { data?: unknown } })?.response?.data;
+  const body = await readErrorBody(data);
+  if (!body) return {};
+  try {
+    const parsed = JSON.parse(body) as { code?: unknown; msg?: unknown };
+    return {
+      code: typeof parsed?.code === 'number' ? parsed.code : undefined,
+      msg: typeof parsed?.msg === 'string' ? parsed.msg : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+/** Content-Range: "bytes 0-131071/236500000" → 236500000；解析不了返回 undefined。 */
+function parseTotalFromContentRange(header: string | undefined): number | undefined {
+  const m = /^bytes\s+\d+-\d+\/(\d+)$/i.exec(String(header ?? '').trim());
+  if (!m) return undefined;
+  const total = Number(m[1]);
+  return Number.isSafeInteger(total) && total > 0 ? total : undefined;
+}
+
+function toBuffer(data: unknown): Buffer {
+  if (Buffer.isBuffer(data)) return data;
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
+  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  if (typeof data === 'string') return Buffer.from(data, 'binary');
+  throw new Error(`unexpected chunk payload type: ${Object.prototype.toString.call(data)}`);
 }
 
 export class MessageSender {
@@ -144,43 +236,168 @@ export class MessageSender {
     }
   }
 
-  async downloadImage(messageId: string, imageKey: string, savePath: string): Promise<boolean> {
+  async downloadImage(messageId: string, imageKey: string, savePath: string): Promise<DownloadOutcome> {
+    return this.downloadResource(messageId, imageKey, 'image', savePath);
+  }
+
+  async downloadFile(messageId: string, fileKey: string, savePath: string): Promise<DownloadOutcome> {
+    return this.downloadResource(messageId, fileKey, 'file', savePath);
+  }
+
+  /**
+   * [本地私改·patch N] 单次 GET → 234037 时回退分片下载；失败携带原因返回。
+   * 见文件头 patch N 说明。label 仅用于保持原有日志文案（'Image downloaded' 等）可 grep。
+   */
+  private async downloadResource(
+    messageId: string,
+    resourceKey: string,
+    type: 'image' | 'file',
+    savePath: string,
+  ): Promise<DownloadOutcome> {
+    const label = type === 'image' ? 'image' : 'file';
+    const keyField = type === 'image' ? { imageKey: resourceKey } : { fileKey: resourceKey };
     try {
       const resp = await this.client.im.v1.messageResource.get({
-        path: { message_id: messageId, file_key: imageKey },
-        params: { type: 'image' },
+        path: { message_id: messageId, file_key: resourceKey },
+        params: { type },
       });
 
       if (resp) {
         await (resp as any).writeFile(savePath);
-        this.logger.info({ messageId, imageKey, savePath }, 'Image downloaded');
+        this.logger.info({ messageId, ...keyField, savePath }, type === 'image' ? 'Image downloaded' : 'File downloaded');
         return true;
       }
-      this.logger.error({ messageId, imageKey }, 'Empty response when downloading image');
+      this.logger.error({ messageId, ...keyField }, `Empty response when downloading ${label}`);
       return false;
     } catch (err) {
-      this.logger.error({ err, messageId, imageKey }, 'Failed to download image');
-      return false;
+      const { code, msg } = await extractFeishuErrorCode(err);
+      if (code === LARGE_FILE_ERR_CODE) {
+        this.logger.warn(
+          { messageId, ...keyField, savePath },
+          `${label} exceeds the 100MB single-GET limit (code 234037), falling back to chunked download`,
+        );
+        const res = await this.downloadResourceChunked(messageId, resourceKey, type, savePath);
+        if (res.ok) return true;
+        return { ok: false, reason: `文件超过 100MB（飞书错误码 234037），分片下载回退也失败：${res.reason}` };
+      }
+      this.logger.error({ err, messageId, ...keyField }, `Failed to download ${label}`);
+      const reason = code !== undefined
+        ? `飞书接口错误码 ${code}${msg ? `（${msg}）` : ''}`
+        : (err instanceof Error ? err.message : String(err));
+      return { ok: false, reason };
     }
   }
 
-  async downloadFile(messageId: string, fileKey: string, savePath: string): Promise<boolean> {
+  /**
+   * [本地私改·patch N] HTTP Range 分片下载（协议与 lark-cli 一致，见文件头说明）。
+   * 128KB 探测段拿 Content-Range 总大小 → 8MB 顺序分段 → 落盘后校验总尺寸。
+   * 失败时删除半成品文件并返回原因。
+   */
+  private async downloadResourceChunked(
+    messageId: string,
+    resourceKey: string,
+    type: 'image' | 'file',
+    savePath: string,
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const url = `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/resources/${encodeURIComponent(resourceKey)}`;
+    const deadline = Date.now() + CHUNK_TOTAL_DEADLINE_MS;
+    const startedAt = Date.now();
+
+    // client.request 自动注入 tenant token；多余字段（responseType/timeout/$return_headers）透传 axios
+    const fetchRange = async (start: number, endInclusive: number): Promise<{ data: unknown; headers: Record<string, unknown> }> => {
+      return await (this.client as unknown as {
+        request: (payload: Record<string, unknown>) => Promise<{ data: unknown; headers: Record<string, unknown> }>;
+      }).request({
+        method: 'GET',
+        url,
+        params: { type },
+        headers: { Range: `bytes=${start}-${endInclusive}` },
+        responseType: 'arraybuffer',
+        timeout: CHUNK_ATTEMPT_TIMEOUT_MS,
+        $return_headers: true,
+      });
+    };
+
+    const fetchRangeWithRetry = async (start: number, endInclusive: number) => {
+      for (let attempt = 1; ; attempt++) {
+        if (Date.now() > deadline) {
+          throw new Error(`chunked download exceeded overall deadline (${CHUNK_TOTAL_DEADLINE_MS}ms)`);
+        }
+        try {
+          return await fetchRange(start, endInclusive);
+        } catch (err) {
+          if (attempt < CHUNK_MAX_ATTEMPTS && isTransientDownloadError(err)) {
+            const delay = CHUNK_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+            this.logger.warn({ messageId, resourceKey, start, endInclusive, attempt, delay }, 'Chunk request failed (transient), retrying');
+            await new Promise((r) => setTimeout(r, delay));
+            continue;
+          }
+          throw err;
+        }
+      }
+    };
+
+    let out: fs.WriteStream | undefined;
     try {
-      const resp = await this.client.im.v1.messageResource.get({
-        path: { message_id: messageId, file_key: fileKey },
-        params: { type: 'file' },
+      // 探测段：拿总大小；服务端不回 Content-Range 时说明整包已在响应里
+      const probe = await fetchRangeWithRetry(0, CHUNK_PROBE_BYTES - 1);
+      const probeBuf = toBuffer(probe.data);
+      const rawContentRange = probe.headers?.['content-range'] ?? probe.headers?.['Content-Range'];
+      const total = parseTotalFromContentRange(rawContentRange === undefined ? undefined : String(rawContentRange));
+      if (total === undefined && rawContentRange !== undefined) {
+        throw new Error(`unparseable Content-Range header: ${String(rawContentRange)}`);
+      }
+
+      out = fs.createWriteStream(savePath);
+      const stream = out;
+      const writeChunk = (buf: Buffer) => new Promise<void>((resolve, reject) => {
+        stream.write(buf, (e) => (e ? reject(e) : resolve()));
+      });
+      const closeStream = () => new Promise<void>((resolve, reject) => {
+        stream.on('error', reject);
+        stream.end(() => resolve());
       });
 
-      if (resp) {
-        await (resp as any).writeFile(savePath);
-        this.logger.info({ messageId, fileKey, savePath }, 'File downloaded');
-        return true;
+      await writeChunk(probeBuf);
+
+      if (total === undefined) {
+        // 没有 Content-Range：响应即完整文件（服务端忽略了 Range）
+        await closeStream();
+        out = undefined;
+        this.logger.info({ messageId, resourceKey, savePath, size: probeBuf.length }, 'Chunked download degenerated to full response, saved');
+        return { ok: true };
       }
-      this.logger.error({ messageId, fileKey }, 'Empty response when downloading file');
-      return false;
+
+      let offset = probeBuf.length;
+      while (offset < total) {
+        const end = Math.min(offset + CHUNK_BYTES, total) - 1;
+        const part = await fetchRangeWithRetry(offset, end);
+        const buf = toBuffer(part.data);
+        const expected = end - offset + 1;
+        if (buf.length !== expected) {
+          throw new Error(`chunk size mismatch at offset ${offset}: got ${buf.length} bytes, want ${expected}`);
+        }
+        await writeChunk(buf);
+        offset += buf.length;
+      }
+      await closeStream();
+      out = undefined;
+
+      const actual = fs.statSync(savePath).size;
+      if (actual !== total) {
+        throw new Error(`assembled file size ${actual} != expected ${total}`);
+      }
+      this.logger.info(
+        { messageId, resourceKey, savePath, size: total, elapsedMs: Date.now() - startedAt },
+        type === 'image' ? 'Image downloaded (chunked)' : 'File downloaded (chunked)',
+      );
+      return { ok: true };
     } catch (err) {
-      this.logger.error({ err, messageId, fileKey }, 'Failed to download file');
-      return false;
+      try { out?.destroy(); } catch { /* noop */ }
+      try { if (fs.existsSync(savePath)) fs.unlinkSync(savePath); } catch { /* noop */ }
+      const reason = err instanceof Error ? err.message : String(err);
+      this.logger.error({ err, messageId, resourceKey, savePath }, 'Chunked download failed');
+      return { ok: false, reason };
     }
   }
 
