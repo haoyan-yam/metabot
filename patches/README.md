@@ -1,6 +1,6 @@
 # MetaBot 本地补丁集 · Local Patch Set
 
-基于上游 [xvirobotics/metabot](https://github.com/xvirobotics/metabot) `main`（f5454e9，2026-07）的 **13 个功能补丁**，主要增强飞书（Feishu/Lark）桥接的群聊体验与消息投递可靠性。
+基于上游 [xvirobotics/metabot](https://github.com/xvirobotics/metabot) `main`（f5454e9，2026-07）的 **14 个功能补丁**，主要增强飞书（Feishu/Lark）桥接的群聊体验与消息投递可靠性。
 
 **`local-patches` 分支已把全部补丁应用进源码**，clone 后切到该分支即可直接使用；本目录附带补丁原件（`git diff` 格式），便于你在自己的 metabot 检出上选择性重打。
 
@@ -21,8 +21,9 @@
 | 11 | upload-retry | K | 飞书文件/图片上传加单次超时 + 指数退避重试，防 502 静默丢文件 |
 | 12 | notify-send-failure | L | 重试仍失败的文件在群里明确告知文件名，不再静默丢弃 |
 | 13 | workspace-claude-template | M | 新 bot 工作区 `CLAUDE.md` 换成精简的初始模板 |
+| 14 | large-file-chunk-download | N | 超 100MB 附件（单次 GET 报 234037）自动转 HTTP Range 分片下载；下载失败不再静默——prompt 里写明文件名与原因；群聊媒体缓存 TTL 5→30 分钟、过期丢弃打 WARN |
 
-代号 A–M 与源码注释里的 `[本地私改·patch X]` 标记一一对应，方便在代码里定位每个补丁的改动和设计取舍说明。
+代号 A–N 与源码注释里的 `[本地私改·patch X]` 标记一一对应，方便在代码里定位每个补丁的改动和设计取舍说明。
 
 ## 使用方式
 
