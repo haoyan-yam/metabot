@@ -37,7 +37,8 @@ git checkout local-patches
 **方式二：在你自己的 metabot 检出上重打**
 
 ```bash
-cd /path/to/your/metabot   # 基于上游 f5454e9 附近的版本
+cd /path/to/your/metabot
+git checkout f5454e9        # 必须基于此基底提交（见下）
 bash patches/apply-all.sh
 ```
 
@@ -45,14 +46,15 @@ bash patches/apply-all.sh
 
 注意事项：
 
-- **必须按文件名编号顺序应用** —— 多个补丁改同一文件，存在上下文依赖。
+- **基底必须是 `f5454e9`** —— 上游 `main` 已前移（截至 2026-07-22 为 `471f36c`，含 #335–#351 / v1.2.0），实测本补丁集在最新上游上无法干净应用（补丁 01 即冲突）。在新上游上使用请等移植版，或自行解决冲突。
+- **必须按文件名编号顺序应用** —— 多个补丁改同一文件，存在上下文依赖（补丁 14 与此前 5 个补丁同文件叠加，必须最后打）。
 - 补丁 02 的配套测试 `tests/media-batch.test.ts` 不在 .patch 内，从 `local-patches` 分支拷贝：
-  `git checkout local-patches -- tests/media-batch.test.ts`
-- 基于其他上游版本重打可能需要手工解决冲突；`--recount` 已容忍行号漂移。
+  `git checkout local-patches -- tests/media-batch.test.ts`（补丁 14 的两个新测试已内含在 .patch 中，无需拷贝）。
+- 每次改动后全套补丁在干净 f5454e9 检出上重打过，与 `local-patches` 分支逐字节一致；全量测试通过。
 
 ## 与上游的关系
 
-其中 3 个补丁已提交上游 PR（截至 2026-07-22 均为 open 状态），上游合并后重打时跳过对应补丁即可：
+其中 3 个补丁已提交上游 PR（复核于 2026-07-22 晚，均仍为 open），上游合并后重打时跳过对应补丁即可：
 
 - 补丁 08（E）→ [xvirobotics/metabot#336](https://github.com/xvirobotics/metabot/pull/336)
 - 补丁 01 的去重部分 → [xvirobotics/metabot#337](https://github.com/xvirobotics/metabot/pull/337)
