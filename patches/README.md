@@ -1,6 +1,6 @@
 # MetaBot 本地补丁集 · Local Patch Set
 
-基于上游 [xvirobotics/metabot](https://github.com/xvirobotics/metabot) `main`（f5454e9，2026-07）的 **12 个功能补丁**，主要增强飞书（Feishu/Lark）桥接的群聊体验与消息投递可靠性。
+基于上游 [xvirobotics/metabot](https://github.com/xvirobotics/metabot) `main`（f5454e9，2026-07）的 **13 个功能补丁**，主要增强飞书（Feishu/Lark）桥接的群聊体验与消息投递可靠性。
 
 **`local-patches` 分支已把全部补丁应用进源码**，clone 后切到该分支即可直接使用；本目录附带补丁原件（`git diff` 格式），便于你在自己的 metabot 检出上选择性重打。
 
@@ -20,8 +20,9 @@
 | 12 | notify-send-failure | L | 重试仍失败的文件在群里明确告知文件名，不再静默丢弃 |
 | 13 | workspace-claude-template | M | 新 bot 工作区 `CLAUDE.md` 换成精简的初始模板 |
 | 14 | large-file-chunk-download | N | 超 100MB 附件（单次 GET 报 234037）自动转 HTTP Range 分片下载；下载失败不再静默——prompt 里写明文件名与原因；群聊媒体缓存 TTL 5→30 分钟、过期丢弃打 WARN |
+| 15 | quote-context-injection | P | 群聊「引用回复 + @bot」时把被引内容注入回合上下文：自家消息走出站台账（卡片存终版文本、媒体存 key 可回捞重下），他人消息走 `message.get` 拉取，被引图片/文件落地为本地文件喂给 agent；任何失败降级提示、绝不影响本回合 |
 
-代号 A–N 与源码注释里的 `[本地私改·patch X]` 标记一一对应，方便在代码里定位每个补丁的改动和设计取舍说明。
+代号 A–P 与源码注释里的 `[本地私改·patch X]` 标记一一对应，方便在代码里定位每个补丁的改动和设计取舍说明（I/J 已移除、O 预留给搁置的 outputs 投递重构，均不复用）。
 
 > **已移除**：原补丁 09（thread-topic-reply，代号 I）与 10（at-requester-on-completion，代号 J）于 2026-07-26 移除——飞书话题（thread）功能在部署中已停用，二者生产一个月零触发，且是未来升级基底时最大的冲突面。编号保留空洞不重排；旧补丁可在 git 历史（提交 fd66d7a 及之前）找回。移除时补丁 04/11/12/14 已在无话题基线上重新生成。
 
@@ -47,9 +48,10 @@ bash patches/apply-all.sh
 注意事项：
 
 - **基底必须是 `f5454e9`** —— 上游 `main` 已前移（截至 2026-07-22 为 `471f36c`，含 #335–#351 / v1.2.0），实测本补丁集在最新上游上无法干净应用（补丁 01 即冲突）。在新上游上使用请等移植版，或自行解决冲突。
-- **必须按文件名编号顺序应用** —— 多个补丁改同一文件，存在上下文依赖（补丁 14 与 01–07、11 多个补丁同文件叠加，必须最后打）。
+- **必须按文件名编号顺序应用** —— 多个补丁改同一文件，存在上下文依赖（补丁 14 与 01–07、11 多个补丁同文件叠加；补丁 15 以 01–14 全打为基线生成，必须最后打）。
 - 补丁 02 的配套测试 `tests/media-batch.test.ts` 不在 .patch 内，从 `local-patches` 分支拷贝：
-  `git checkout local-patches -- tests/media-batch.test.ts`（补丁 14 的两个新测试已内含在 .patch 中，无需拷贝）。
+  `git checkout local-patches -- tests/media-batch.test.ts`（补丁 14 的两个新测试、补丁 15 的三个新测试与两个新源文件已内含在各自 .patch 中，无需拷贝）。
+- 补丁 15 的出站台账落在 `~/.metabot/outbound-ledger.db`（仓库外），升级/重打不影响已积累的台账。
 - 每次改动后全套补丁在干净 f5454e9 检出上重打过，与 `local-patches` 分支逐字节一致；全量测试通过。
 
 ## 与上游的关系
