@@ -97,6 +97,8 @@ export interface IncomingMessage {
   chatId: string;
   chatType: string;
   userId: string;
+  /** [本地私改·patch P] 引用回复(quote-reply)时被引用消息的 message_id；用于把被引内容注入回合上下文。 */
+  parentId?: string;
   text: string;
   timestamp?: number;
   imageKey?: string;

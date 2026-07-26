@@ -189,6 +189,12 @@ export function createEventDispatcher(
         const chatId = message.chat_id;
         const chatType = message.chat_type;
         const messageId = message.message_id;
+        // [本地私改·patch P] 引用回复带 parent_id（被引消息 id）；桥接据此把被引内容注入回合上下文。
+        // root_id 仅入日志，供「话题内普通消息是否误带 parent_id」这类语义边界的事后诊断。
+        const parentId = message.parent_id;
+        if (parentId) {
+          logger.info({ chatId, userId, messageId, parentId, rootId: message.root_id }, 'Message is a quote-reply');
+        }
 
         // Dedup: Feishu retries delivery if we respond slowly (e.g. during a
         // long task). Mark this messageId as seen up-front so retries are dropped.
@@ -350,7 +356,7 @@ export function createEventDispatcher(
           }
         }
 
-        onMessage({ messageId, chatId, chatType, userId, text, imageKey, fileKey, fileName, extraMedia });
+        onMessage({ messageId, chatId, chatType, userId, parentId, text, imageKey, fileKey, fileName, extraMedia });
       } catch (err) {
         logger.error({ err }, 'Error handling message event');
       }
@@ -425,7 +431,8 @@ function extractImagesFromPost(content: Record<string, unknown>): string[] {
  *   With locale wrapper: { "zh_cn": { "title": "...", "content": [[{tag, text}, ...], ...] } }
  *   Without locale wrapper: { "title": "...", "content": [[{tag, text}, ...], ...] }
  */
-function extractTextFromPost(content: Record<string, unknown>): string {
+// [本地私改·patch P] 导出仅为 quote-context 复用富文本解析；生产逻辑不变。
+export function extractTextFromPost(content: Record<string, unknown>): string {
   // Try to find the post body — either the content itself or nested under a locale key
   const bodies: Array<Record<string, unknown>> = [];
 

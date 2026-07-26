@@ -5,6 +5,8 @@ import type { BotConfigBase } from '../config.js';
 import type { Logger } from '../utils/logger.js';
 import type { BackgroundEvent, IncomingMessage, CardState, PendingQuestion, TeamState, TeamMember, TeamTask } from '../types.js';
 import type { DownloadOutcome, IMessageSender } from './message-sender.interface.js';
+import type { OutboundLedger } from './outbound-ledger.js';
+import { buildQuoteContext } from './quote-context.js';
 import type { DocSync } from '../sync/doc-sync.js';
 import type {
   Engine,
@@ -277,6 +279,8 @@ export class MessageBridge {
     private config: BotConfigBase,
     private logger: Logger,
     private sender: IMessageSender,
+    // [本地私改·patch P] 出站台账（引用回复解析用）；可选，未传时引用解析走 API/降级
+    private deps?: { outboundLedger?: OutboundLedger },
   ) {
     this.engine = createEngine(config, logger);
     this.executor = this.engine.createExecutor();
@@ -1647,7 +1651,8 @@ export class MessageBridge {
       // and merging is allowed even at MAX_QUEUE_SIZE since it doesn't grow the
       // queue — a user can still refine their pending message when full.
       const tail = queue[queue.length - 1];
-      if (tail && tail.userId === msg.userId) {
+      // [本地私改·patch P] 追加 parentId 相等判断：引用不同消息的排队消息不合并（各注入各的引文）
+      if (tail && tail.userId === msg.userId && tail.parentId === msg.parentId) {
         queue[queue.length - 1] = mergeSameSenderMessages(tail, msg);
         this.messageQueues.set(chatId, queue);
         this.audit.log({ event: 'task_queued_merged', botName: this.config.name, chatId, userId: msg.userId, prompt: msg.text, meta: { position: queue.length } });
@@ -2076,6 +2081,21 @@ export class MessageBridge {
         });
       }
     };
+
+    // [本地私改·patch P] 引用回复上下文注入：自家消息走出站台账（卡片记终版文本、
+    // 媒体记 key，本地被补丁 E 清掉后可回捞），他人消息走 message.get；被引媒体落地为
+    // 本地文件供 agent 读取。任何失败降级为「读不到被引内容」提醒，绝不让本回合失败。
+    // 注入时机在思考卡发出之后——被引大文件回捞期间用户已能看到进度卡。
+    const quoteReminder = await buildQuoteContext(msg, {
+      botName: this.config.name,
+      ledger: this.deps?.outboundLedger,
+      sender: this.sender,
+      downloadsDir,
+      logger: this.logger,
+    });
+    if (quoteReminder) {
+      prompt = `${quoteReminder}\n\n${prompt}`;
+    }
 
     // [本地私改·patch H] 把「本条消息是谁发的」注入本回合 prompt —— 桥接原本
     // 只把 sender open_id 用于审计/去重/@提醒，从不喂给模型，bot 要给「提问人」

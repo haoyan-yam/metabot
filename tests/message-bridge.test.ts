@@ -382,6 +382,53 @@ describe('MessageBridge chatId cleanup (memory leak guard)', () => {
 });
 
 /**
+ * [本地私改·patch P] 引用回复的排队合并守卫：引用不同消息的连发不合并
+ * （否则一条合并消息只带一个 parentId，第二条的引文会被静默吃掉）；
+ * 引用同一条消息、或都不带引用（undefined === undefined）时照旧合并。
+ */
+describe('MessageBridge quote-reply queue guard (patch P)', () => {
+  function fakeRunningTask() {
+    return { executionHandle: { finish() {} }, abortController: new AbortController() };
+  }
+
+  it('does not merge queued messages quoting different parents', async () => {
+    const sender = makeSender();
+    const bridge = new MessageBridge(makeConfig(), mockLogger, sender as any) as any;
+    bridge.runningTasks.set('chat-1', fakeRunningTask());
+
+    await bridge.handleMessage({ messageId: 'm1', chatId: 'chat-1', chatType: 'group', userId: 'u1', parentId: 'om_a', text: 'tweak A' });
+    await bridge.handleMessage({ messageId: 'm2', chatId: 'chat-1', chatType: 'group', userId: 'u1', parentId: 'om_b', text: 'tweak B' });
+    await bridge.handleMessage({ messageId: 'm3', chatId: 'chat-1', chatType: 'group', userId: 'u1', parentId: 'om_b', text: 'more detail for B' });
+    await bridge.handleMessage({ messageId: 'm4', chatId: 'chat-1', chatType: 'group', userId: 'u1', text: 'plain follow-up' });
+
+    const queue = bridge.messageQueues.get('chat-1');
+    expect(queue).toHaveLength(3); // om_a ｜ om_b（m3 并入）｜ 无引用
+    expect(queue[0].parentId).toBe('om_a');
+    expect(queue[1].parentId).toBe('om_b');
+    expect(queue[1].text).toContain('tweak B');
+    expect(queue[1].text).toContain('more detail for B');
+    expect(queue[2].parentId).toBeUndefined();
+
+    bridge.runningTasks.delete('chat-1');
+    bridge.destroy();
+  });
+
+  it('plain (no-quote) rapid-fire messages still merge as before (patch C regression)', async () => {
+    const sender = makeSender();
+    const bridge = new MessageBridge(makeConfig(), mockLogger, sender as any) as any;
+    bridge.runningTasks.set('chat-1', fakeRunningTask());
+
+    await bridge.handleMessage({ messageId: 'm1', chatId: 'chat-1', chatType: 'group', userId: 'u1', text: 'first' });
+    await bridge.handleMessage({ messageId: 'm2', chatId: 'chat-1', chatType: 'group', userId: 'u1', text: 'second' });
+
+    expect(bridge.messageQueues.get('chat-1')).toHaveLength(1);
+
+    bridge.runningTasks.delete('chat-1');
+    bridge.destroy();
+  });
+});
+
+/**
  * Spontaneous-card helpers — extracted so the snippet generator and card
  * title are unit-testable without booting a real MessageBridge.
  *

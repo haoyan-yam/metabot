@@ -7,6 +7,7 @@ import { createEventDispatcher } from './feishu/event-handler.js';
 import { MessageSender } from './feishu/message-sender.js';
 import { FeishuSenderAdapter } from './feishu/feishu-sender-adapter.js';
 import { MessageBridge } from './bridge/message-bridge.js';
+import { OutboundLedger } from './bridge/outbound-ledger.js';
 import { loadRestartBreadcrumb } from './bridge/restart-notice.js';
 import type { IMessageSender } from './bridge/message-sender.interface.js';
 import type { BotConfigBase } from './config.js';
@@ -65,7 +66,7 @@ function setupFeishuLocalAddress(logger: Logger): https.Agent | undefined {
   return agent;
 }
 
-async function startFeishuBot(botConfig: BotConfig, logger: Logger, localAgent?: https.Agent): Promise<FeishuBotHandle> {
+async function startFeishuBot(botConfig: BotConfig, logger: Logger, localAgent?: https.Agent, outboundLedger?: OutboundLedger): Promise<FeishuBotHandle> {
   const botLogger = logger.child({ bot: botConfig.name });
 
   botLogger.info('Starting Feishu bot...');
@@ -93,8 +94,9 @@ async function startFeishuBot(botConfig: BotConfig, logger: Logger, localAgent?:
 
   // Create sender and bridge (FeishuSenderAdapter wraps the Feishu-specific MessageSender)
   const rawSender = new MessageSender(client, botLogger);
-  const sender = new FeishuSenderAdapter(rawSender);
-  const bridge = new MessageBridge(botConfig, botLogger, sender);
+  // [本地私改·patch P] 出站台账：adapter 写入（记每条出站消息）、bridge 读取（引用回复解析）
+  const sender = new FeishuSenderAdapter(rawSender, { ledger: outboundLedger, botName: botConfig.name });
+  const bridge = new MessageBridge(botConfig, botLogger, sender, { outboundLedger });
 
   // Create event dispatcher wired to the bridge
   const dispatcher = createEventDispatcher(
@@ -201,6 +203,10 @@ async function main() {
   // Create bot registry
   const registry = new BotRegistry();
 
+  // [本地私改·patch P] 出站消息台账——单例、全部 Feishu bot 共用（om_* 全局唯一；
+  // bot_name 列区分归属，跨 bot 引用也能命中）。在 bot 启动前构造，无竞态窗口。
+  const outboundLedger = new OutboundLedger(logger);
+
   // Must run before ANY lark.Client makes a request (token fetches included)
   // so no Feishu socket ever goes out the default route.
   const feishuLocalAgent = setupFeishuLocalAddress(logger);
@@ -210,7 +216,7 @@ async function main() {
   const feishuHandles = feishuCount > 0
     ? await startBotsSafely(
       appConfig.feishuBots,
-      (bot) => startFeishuBot(bot, logger, feishuLocalAgent),
+      (bot) => startFeishuBot(bot, logger, feishuLocalAgent, outboundLedger),
       logger,
       'feishu',
     )
@@ -388,6 +394,7 @@ async function main() {
       docSync.destroy();
     }
     sessionRegistry.close();
+    outboundLedger.close(); // [本地私改·patch P]
     const teardowns: Promise<void>[] = [];
     for (const handle of feishuHandles) {
       teardowns.push(handle.bridge.destroyAsync());

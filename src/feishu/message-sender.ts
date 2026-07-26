@@ -1,7 +1,18 @@
 import * as fs from 'node:fs';
 import type * as lark from '@larksuiteoapi/node-sdk';
 import type { Logger } from '../utils/logger.js';
-import type { DownloadOutcome } from '../bridge/message-sender.interface.js';
+import type { DownloadOutcome, FetchedMessage } from '../bridge/message-sender.interface.js';
+
+/**
+ * [本地私改·patch P] 媒体发送结果：成功时带回 message_id 与媒资 key，供出站台账登记
+ * （key 是耐久句柄——本地文件被补丁 E 清掉后，引用回复仍可按 (messageId, key) 从飞书回捞）。
+ * 失败仍为 false；对象为 truthy，旧真值判断全兼容。messageId 可能拿不到（响应缺失），
+ * 不能因此谎报失败——否则会误触发补丁 L 的「发送失败」群通知。
+ */
+export interface MediaSendOutcome {
+  messageId?: string;
+  mediaKey: string;
+}
 
 /**
  * [本地私改·patch G] 出站脱敏：飞书对话里不透露本机真实路径与密钥。
@@ -401,9 +412,9 @@ export class MessageSender {
     return undefined;
   }
 
-  async sendImage(chatId: string, imageKey: string): Promise<boolean> {
+  async sendImage(chatId: string, imageKey: string): Promise<MediaSendOutcome | false> {
     try {
-      await this.client.im.v1.message.create({
+      const resp = await this.client.im.v1.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
@@ -411,14 +422,14 @@ export class MessageSender {
           msg_type: 'image',
         },
       });
-      return true;
+      return { messageId: resp?.data?.message_id, mediaKey: imageKey }; // [本地私改·patch P] 台账登记用
     } catch (err) {
       this.logger.error({ err, chatId, imageKey }, 'Failed to send image');
       return false;
     }
   }
 
-  async sendImageFile(chatId: string, filePath: string): Promise<boolean> {
+  async sendImageFile(chatId: string, filePath: string): Promise<MediaSendOutcome | false> {
     const imageKey = await this.uploadImage(filePath);
     if (!imageKey) return false;
     return this.sendImage(chatId, imageKey);
@@ -456,9 +467,9 @@ export class MessageSender {
     return undefined;
   }
 
-  async sendFile(chatId: string, fileKey: string): Promise<boolean> {
+  async sendFile(chatId: string, fileKey: string): Promise<MediaSendOutcome | false> {
     try {
-      await this.client.im.v1.message.create({
+      const resp = await this.client.im.v1.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
@@ -466,22 +477,22 @@ export class MessageSender {
           msg_type: 'file',
         },
       });
-      return true;
+      return { messageId: resp?.data?.message_id, mediaKey: fileKey }; // [本地私改·patch P]
     } catch (err) {
       this.logger.error({ err, chatId, fileKey }, 'Failed to send file');
       return false;
     }
   }
 
-  async sendLocalFile(chatId: string, filePath: string, fileName: string, fileType: string): Promise<boolean> {
+  async sendLocalFile(chatId: string, filePath: string, fileName: string, fileType: string): Promise<MediaSendOutcome | false> {
     const fileKey = await this.uploadFile(filePath, fileName, fileType);
     if (!fileKey) return false;
     return this.sendFile(chatId, fileKey);
   }
 
-  async sendAudio(chatId: string, fileKey: string): Promise<boolean> {
+  async sendAudio(chatId: string, fileKey: string): Promise<MediaSendOutcome | false> {
     try {
-      await this.client.im.v1.message.create({
+      const resp = await this.client.im.v1.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
@@ -489,14 +500,14 @@ export class MessageSender {
           msg_type: 'audio',
         },
       });
-      return true;
+      return { messageId: resp?.data?.message_id, mediaKey: fileKey }; // [本地私改·patch P]
     } catch (err) {
       this.logger.error({ err, chatId, fileKey }, 'Failed to send audio');
       return false;
     }
   }
 
-  async sendAudioFile(chatId: string, filePath: string, fileName: string): Promise<boolean> {
+  async sendAudioFile(chatId: string, filePath: string, fileName: string): Promise<MediaSendOutcome | false> {
     const fileKey = await this.uploadFile(filePath, fileName, 'opus');
     if (!fileKey) return false;
     return this.sendAudio(chatId, fileKey);
@@ -516,23 +527,24 @@ export class MessageSender {
     }
   }
 
-  async sendText(chatId: string, text: string, replyToMessageId?: string): Promise<void> {
+  // [本地私改·patch P] 返回 message_id（原为 void）供出站台账登记；失败仍返回 undefined，行为不变。
+  async sendText(chatId: string, text: string, replyToMessageId?: string): Promise<string | undefined> {
     const safeText = redactSensitive(text); // [本地私改·patch G] 出站脱敏
     // [本地私改] 传了 replyToMessageId 就用 im.message.reply 引用回复(触发提问人的飞书通知);
     // reply 失败(原消息被撤回/过期/权限等)则回退普通 create,保证通知即使引用失败也照发。
     if (replyToMessageId) {
       try {
-        await this.client.im.v1.message.reply({
+        const resp = await this.client.im.v1.message.reply({
           path: { message_id: replyToMessageId },
           data: { content: JSON.stringify({ text: safeText }), msg_type: 'text' },
         });
-        return;
+        return resp?.data?.message_id;
       } catch (err) {
         this.logger.warn({ err, replyToMessageId }, 'Failed to reply-quote text, falling back to plain send');
       }
     }
     try {
-      await this.client.im.v1.message.create({
+      const resp = await this.client.im.v1.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
@@ -540,8 +552,36 @@ export class MessageSender {
           msg_type: 'text',
         },
       });
+      return resp?.data?.message_id;
     } catch (err) {
       this.logger.error({ err, chatId }, 'Failed to send text');
+      return undefined;
+    }
+  }
+
+  /**
+   * [本地私改·patch P] 拉取指定消息内容（引用回复解析用）。任何失败（无权限、
+   * 已删除、网络、SDK 以 {code,msg} 返回业务错）都返回 undefined，绝不抛出。
+   */
+  async fetchMessage(messageId: string): Promise<FetchedMessage | undefined> {
+    try {
+      const resp = await this.client.im.v1.message.get({ path: { message_id: messageId } });
+      const item = resp?.data?.items?.[0];
+      if (!item) {
+        this.logger.warn({ messageId, code: (resp as any)?.code, msg: (resp as any)?.msg }, 'fetchMessage returned no item');
+        return undefined;
+      }
+      return {
+        msgType: item.msg_type ?? 'unknown',
+        content: item.body?.content ?? '',
+        senderId: item.sender?.id,
+        senderIdType: item.sender?.id_type,
+        senderType: item.sender?.sender_type,
+        deleted: item.deleted,
+      };
+    } catch (err) {
+      this.logger.warn({ err, messageId }, 'fetchMessage failed');
+      return undefined;
     }
   }
 }

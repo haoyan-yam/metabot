@@ -15,6 +15,20 @@ import type { CardState } from '../types.js';
 export type DownloadOutcome = boolean | { ok: false; reason: string };
 
 /**
+ * [本地私改·patch P] Snapshot of a fetched message, for quote-reply resolution.
+ * `content` is the raw platform payload (Feishu: the body.content JSON string);
+ * interpretation is up to the caller (quote-context).
+ */
+export interface FetchedMessage {
+  msgType: string;
+  content: string;
+  senderId?: string;
+  senderIdType?: string;
+  senderType?: string;
+  deleted?: boolean;
+}
+
+/**
  * Platform-agnostic message sender interface.
  * Implemented by each IM platform (Feishu, Telegram, etc.).
  */
@@ -76,6 +90,13 @@ export interface IMessageSender {
 
   /** Download a user-sent file to a local path. See DownloadOutcome ([本地私改·patch N]). */
   downloadFile(messageId: string, fileKey: string, savePath: string): Promise<DownloadOutcome>;
+
+  /**
+   * [本地私改·patch P] Fetch a message's content by id (quote-reply resolution).
+   * Optional — platforms without the capability omit it. Never throws; any
+   * failure (permission, deleted, network) resolves to undefined.
+   */
+  fetchMessage?(messageId: string): Promise<FetchedMessage | undefined>;
 
   /** If true, the bridge will not send a separate "Task completed" text after the card update. */
   skipCompletionNotice?: boolean;
