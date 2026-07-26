@@ -258,10 +258,10 @@ index 0000000..808338c
 +}
 diff --git a/src/bridge/quote-context.ts b/src/bridge/quote-context.ts
 new file mode 100644
-index 0000000..8383ef8
+index 0000000..ea0d04c
 --- /dev/null
 +++ b/src/bridge/quote-context.ts
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,280 @@
 +/**
 + * [本地私改·patch P] Quote-reply context resolution — 把「引用回复」的被引内容
 + * 变成 agent 可用的回合上下文。
@@ -311,6 +311,22 @@ index 0000000..8383ef8
 +
 +function failReason(res: DownloadOutcome): string {
 +  return typeof res === 'object' && !res.ok && res.reason ? res.reason : 'unknown error';
++}
++
++/**
++ * 本地已有同名非空文件即可复用，跳过重下载。适用两处：
++ *   - 三方媒体：入站下载与本处的保存路径命名完全一致（`${key}.png` / `${key}_${name}`），
++ *     补丁 B 保留在 inputs/ 的历史附件正好躺在目标路径上——复用它既省大文件重下
++ *     （100MB+ 走分片要分钟级），又在 messageResource 对旧消息有权限门槛时多一条自救路径；
++ *   - bot 媒体回捞：同一文件被反复引用时，第二次起直接用上次回捞的副本。
++ * 只认非空文件：下载失败的残件（补丁 N 会删，入站单发极端情况可能留空文件）不复用。
++ */
++function reusableLocalFile(p: string): boolean {
++  try {
++    return fs.existsSync(p) && fs.statSync(p).size > 0;
++  } catch {
++    return false;
++  }
 +}
 +
 +const MEDIA_KIND_LABEL: Record<string, string> = {
@@ -418,13 +434,17 @@ index 0000000..8383ef8
 +      }
 +      // 媒体：本地文件还在就直接用；被补丁 E 清掉则按 (台账行 messageId, mediaKey) 回捞
 +      const mediaKind = rec.kind;
-+      if (rec.filePath && fs.existsSync(rec.filePath)) {
++      if (rec.filePath && reusableLocalFile(rec.filePath)) {
 +        return { kind: 'bot-media', mediaKind, localPath: rec.filePath, fileName: rec.fileName, otherBot };
 +      }
 +      if (rec.mediaKey) {
 +        const savePath = mediaKind === 'image'
 +          ? path.join(deps.downloadsDir, `${rec.mediaKey}.png`)
 +          : path.join(deps.downloadsDir, `${rec.mediaKey}_${rec.fileName ?? 'quoted.bin'}`);
++        // 上次引用已回捞过的副本直接复用，不再重下
++        if (reusableLocalFile(savePath)) {
++          return { kind: 'bot-media', mediaKind, localPath: savePath, fileName: rec.fileName, otherBot };
++        }
 +        try {
 +          const dl = mediaKind === 'image'
 +            ? await deps.sender.downloadImage(rec.messageId, rec.mediaKey, savePath)
@@ -465,6 +485,11 @@ index 0000000..8383ef8
 +        const imageKey = JSON.parse(fm.content)?.image_key;
 +        if (!imageKey) return { kind: 'unreadable' };
 +        const savePath = path.join(deps.downloadsDir, `${imageKey}.png`);
++        // 与入站下载同路径命名：补丁 B 保留在 inputs/ 的历史图片直接复用，跳过重下
++        if (reusableLocalFile(savePath)) {
++          logger.info({ parentId, savePath }, 'Quoted third-party image reused from local downloads');
++          return { kind: 'third-party-media', mediaKind: 'image', localPath: savePath, senderId: fm.senderId };
++        }
 +        const dl = await deps.sender.downloadImage(parentId, imageKey, savePath);
 +        if (dl === true) {
 +          return { kind: 'third-party-media', mediaKind: 'image', localPath: savePath, senderId: fm.senderId };
@@ -478,6 +503,11 @@ index 0000000..8383ef8
 +        const fileName = parsed.file_name;
 +        if (!fileKey) return { kind: 'unreadable' };
 +        const savePath = path.join(deps.downloadsDir, `${fileKey}_${fileName ?? 'quoted.bin'}`);
++        // 同上：历史附件（补丁 B 保留）在目标路径上就复用，大文件免重下、权限不足也能自救
++        if (reusableLocalFile(savePath)) {
++          logger.info({ parentId, savePath }, 'Quoted third-party file reused from local downloads');
++          return { kind: 'third-party-media', mediaKind: 'file', localPath: savePath, fileName, senderId: fm.senderId };
++        }
 +        const dl = await deps.sender.downloadFile(parentId, fileKey, savePath);
 +        if (dl === true) {
 +          return { kind: 'third-party-media', mediaKind: 'file', localPath: savePath, fileName, senderId: fm.senderId };
@@ -1334,10 +1364,10 @@ index 0000000..79c3520
 +});
 diff --git a/tests/quote-context.test.ts b/tests/quote-context.test.ts
 new file mode 100644
-index 0000000..69125bf
+index 0000000..ad7403d
 --- /dev/null
 +++ b/tests/quote-context.test.ts
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,275 @@
 +import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 +import * as fs from 'node:fs';
 +import * as path from 'node:path';
@@ -1528,6 +1558,45 @@ index 0000000..69125bf
 +    deps.downloadFile.mockResolvedValue({ ok: false, reason: 'permission denied' });
 +    const res = await resolveQuotedMessage(msg(), deps);
 +    expect(res).toMatchObject({ kind: 'third-party-media-failed', fileName: 'r.pdf', reason: 'permission denied' });
++  });
++
++  // [复用判断] 入站下载与引用解析同路径命名——补丁 B 保留在 inputs/ 的历史附件直接复用。
++  it('third-party image reuses an existing non-empty local file and skips the download', async () => {
++    fs.writeFileSync(path.join(tmpDir, 'img_3rd.png'), 'png-bytes');
++    const deps = makeDeps({ downloadsDir: tmpDir });
++    deps.fetchMessage.mockResolvedValue({ msgType: 'image', content: JSON.stringify({ image_key: 'img_3rd' }), senderId: 'ou_x' });
++    const res = await resolveQuotedMessage(msg(), deps);
++    expect(deps.downloadImage).not.toHaveBeenCalled();
++    expect(res).toMatchObject({ kind: 'third-party-media', localPath: path.join(tmpDir, 'img_3rd.png') });
++  });
++
++  it('third-party file reuses an existing local copy even when the download would fail (patch-B self-rescue)', async () => {
++    fs.writeFileSync(path.join(tmpDir, 'fk_r.pdf'), 'pdf-bytes');
++    const deps = makeDeps({ downloadsDir: tmpDir });
++    deps.fetchMessage.mockResolvedValue({ msgType: 'file', content: JSON.stringify({ file_key: 'fk', file_name: 'r.pdf' }) });
++    deps.downloadFile.mockResolvedValue({ ok: false, reason: 'permission denied' }); // 即便下载会失败
++    const res = await resolveQuotedMessage(msg(), deps);
++    expect(deps.downloadFile).not.toHaveBeenCalled();
++    expect(res).toMatchObject({ kind: 'third-party-media', fileName: 'r.pdf', localPath: path.join(tmpDir, 'fk_r.pdf') });
++  });
++
++  it('a zero-byte local leftover is NOT reused — download still runs', async () => {
++    fs.writeFileSync(path.join(tmpDir, 'img_3rd.png'), '');
++    const deps = makeDeps({ downloadsDir: tmpDir });
++    deps.fetchMessage.mockResolvedValue({ msgType: 'image', content: JSON.stringify({ image_key: 'img_3rd' }), senderId: 'ou_x' });
++    await resolveQuotedMessage(msg(), deps);
++    expect(deps.downloadImage).toHaveBeenCalledOnce();
++  });
++
++  it('bot-media re-download target already present from a previous quote is reused', async () => {
++    fs.writeFileSync(path.join(tmpDir, 'img_k.png'), 'cached');
++    const deps = makeDeps({
++      downloadsDir: tmpDir,
++      ledger: { get: vi.fn().mockReturnValue({ messageId: 'om_parent', botName: 'botA', chatId: 'oc_1', kind: 'image', filePath: path.join(tmpDir, 'gone.png'), mediaKey: 'img_k', ts: 1 }) },
++    });
++    const res = await resolveQuotedMessage(msg(), deps);
++    expect(deps.downloadImage).not.toHaveBeenCalled();
++    expect(res).toMatchObject({ kind: 'bot-media', localPath: path.join(tmpDir, 'img_k.png') });
 +  });
 +
 +  it('fetch failure / deleted message / missing capability resolve to unreadable', async () => {
