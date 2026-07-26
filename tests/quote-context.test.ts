@@ -190,6 +190,45 @@ describe('resolveQuotedMessage', () => {
     expect(res).toMatchObject({ kind: 'third-party-media-failed', fileName: 'r.pdf', reason: 'permission denied' });
   });
 
+  // [复用判断] 入站下载与引用解析同路径命名——补丁 B 保留在 inputs/ 的历史附件直接复用。
+  it('third-party image reuses an existing non-empty local file and skips the download', async () => {
+    fs.writeFileSync(path.join(tmpDir, 'img_3rd.png'), 'png-bytes');
+    const deps = makeDeps({ downloadsDir: tmpDir });
+    deps.fetchMessage.mockResolvedValue({ msgType: 'image', content: JSON.stringify({ image_key: 'img_3rd' }), senderId: 'ou_x' });
+    const res = await resolveQuotedMessage(msg(), deps);
+    expect(deps.downloadImage).not.toHaveBeenCalled();
+    expect(res).toMatchObject({ kind: 'third-party-media', localPath: path.join(tmpDir, 'img_3rd.png') });
+  });
+
+  it('third-party file reuses an existing local copy even when the download would fail (patch-B self-rescue)', async () => {
+    fs.writeFileSync(path.join(tmpDir, 'fk_r.pdf'), 'pdf-bytes');
+    const deps = makeDeps({ downloadsDir: tmpDir });
+    deps.fetchMessage.mockResolvedValue({ msgType: 'file', content: JSON.stringify({ file_key: 'fk', file_name: 'r.pdf' }) });
+    deps.downloadFile.mockResolvedValue({ ok: false, reason: 'permission denied' }); // 即便下载会失败
+    const res = await resolveQuotedMessage(msg(), deps);
+    expect(deps.downloadFile).not.toHaveBeenCalled();
+    expect(res).toMatchObject({ kind: 'third-party-media', fileName: 'r.pdf', localPath: path.join(tmpDir, 'fk_r.pdf') });
+  });
+
+  it('a zero-byte local leftover is NOT reused — download still runs', async () => {
+    fs.writeFileSync(path.join(tmpDir, 'img_3rd.png'), '');
+    const deps = makeDeps({ downloadsDir: tmpDir });
+    deps.fetchMessage.mockResolvedValue({ msgType: 'image', content: JSON.stringify({ image_key: 'img_3rd' }), senderId: 'ou_x' });
+    await resolveQuotedMessage(msg(), deps);
+    expect(deps.downloadImage).toHaveBeenCalledOnce();
+  });
+
+  it('bot-media re-download target already present from a previous quote is reused', async () => {
+    fs.writeFileSync(path.join(tmpDir, 'img_k.png'), 'cached');
+    const deps = makeDeps({
+      downloadsDir: tmpDir,
+      ledger: { get: vi.fn().mockReturnValue({ messageId: 'om_parent', botName: 'botA', chatId: 'oc_1', kind: 'image', filePath: path.join(tmpDir, 'gone.png'), mediaKey: 'img_k', ts: 1 }) },
+    });
+    const res = await resolveQuotedMessage(msg(), deps);
+    expect(deps.downloadImage).not.toHaveBeenCalled();
+    expect(res).toMatchObject({ kind: 'bot-media', localPath: path.join(tmpDir, 'img_k.png') });
+  });
+
   it('fetch failure / deleted message / missing capability resolve to unreadable', async () => {
     const deps1 = makeDeps();
     deps1.fetchMessage.mockResolvedValue(undefined);

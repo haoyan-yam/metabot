@@ -49,6 +49,22 @@ function failReason(res: DownloadOutcome): string {
   return typeof res === 'object' && !res.ok && res.reason ? res.reason : 'unknown error';
 }
 
+/**
+ * 本地已有同名非空文件即可复用，跳过重下载。适用两处：
+ *   - 三方媒体：入站下载与本处的保存路径命名完全一致（`${key}.png` / `${key}_${name}`），
+ *     补丁 B 保留在 inputs/ 的历史附件正好躺在目标路径上——复用它既省大文件重下
+ *     （100MB+ 走分片要分钟级），又在 messageResource 对旧消息有权限门槛时多一条自救路径；
+ *   - bot 媒体回捞：同一文件被反复引用时，第二次起直接用上次回捞的副本。
+ * 只认非空文件：下载失败的残件（补丁 N 会删，入站单发极端情况可能留空文件）不复用。
+ */
+function reusableLocalFile(p: string): boolean {
+  try {
+    return fs.existsSync(p) && fs.statSync(p).size > 0;
+  } catch {
+    return false;
+  }
+}
+
 const MEDIA_KIND_LABEL: Record<string, string> = {
   image: '一张图片',
   file: '一个文件',
@@ -154,13 +170,17 @@ export async function resolveQuotedMessage(
       }
       // 媒体：本地文件还在就直接用；被补丁 E 清掉则按 (台账行 messageId, mediaKey) 回捞
       const mediaKind = rec.kind;
-      if (rec.filePath && fs.existsSync(rec.filePath)) {
+      if (rec.filePath && reusableLocalFile(rec.filePath)) {
         return { kind: 'bot-media', mediaKind, localPath: rec.filePath, fileName: rec.fileName, otherBot };
       }
       if (rec.mediaKey) {
         const savePath = mediaKind === 'image'
           ? path.join(deps.downloadsDir, `${rec.mediaKey}.png`)
           : path.join(deps.downloadsDir, `${rec.mediaKey}_${rec.fileName ?? 'quoted.bin'}`);
+        // 上次引用已回捞过的副本直接复用，不再重下
+        if (reusableLocalFile(savePath)) {
+          return { kind: 'bot-media', mediaKind, localPath: savePath, fileName: rec.fileName, otherBot };
+        }
         try {
           const dl = mediaKind === 'image'
             ? await deps.sender.downloadImage(rec.messageId, rec.mediaKey, savePath)
@@ -201,6 +221,11 @@ export async function resolveQuotedMessage(
         const imageKey = JSON.parse(fm.content)?.image_key;
         if (!imageKey) return { kind: 'unreadable' };
         const savePath = path.join(deps.downloadsDir, `${imageKey}.png`);
+        // 与入站下载同路径命名：补丁 B 保留在 inputs/ 的历史图片直接复用，跳过重下
+        if (reusableLocalFile(savePath)) {
+          logger.info({ parentId, savePath }, 'Quoted third-party image reused from local downloads');
+          return { kind: 'third-party-media', mediaKind: 'image', localPath: savePath, senderId: fm.senderId };
+        }
         const dl = await deps.sender.downloadImage(parentId, imageKey, savePath);
         if (dl === true) {
           return { kind: 'third-party-media', mediaKind: 'image', localPath: savePath, senderId: fm.senderId };
@@ -214,6 +239,11 @@ export async function resolveQuotedMessage(
         const fileName = parsed.file_name;
         if (!fileKey) return { kind: 'unreadable' };
         const savePath = path.join(deps.downloadsDir, `${fileKey}_${fileName ?? 'quoted.bin'}`);
+        // 同上：历史附件（补丁 B 保留）在目标路径上就复用，大文件免重下、权限不足也能自救
+        if (reusableLocalFile(savePath)) {
+          logger.info({ parentId, savePath }, 'Quoted third-party file reused from local downloads');
+          return { kind: 'third-party-media', mediaKind: 'file', localPath: savePath, fileName, senderId: fm.senderId };
+        }
         const dl = await deps.sender.downloadFile(parentId, fileKey, savePath);
         if (dl === true) {
           return { kind: 'third-party-media', mediaKind: 'file', localPath: savePath, fileName, senderId: fm.senderId };
