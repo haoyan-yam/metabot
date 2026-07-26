@@ -51,32 +51,28 @@ function makeCodexConfig(): BotConfigBase {
 }
 
 function makeSender() {
-  const sent: Array<{ chatId: string; state: CardState; replyTo?: unknown }> = [];
+  const sent: Array<{ chatId: string; state: CardState }> = [];
   const updated: Array<{ messageId: string; state: CardState }> = [];
-  const notices: Array<{ chatId: string; title: string; content: string; color?: string; replyTo?: unknown }> = [];
   const sender = {
     sent,
     updated,
-    notices,
-    async sendCard(chatId: string, state: CardState, replyTo?: unknown) {
-      sent.push({ chatId, state, replyTo });
+    async sendCard(chatId: string, state: CardState) {
+      sent.push({ chatId, state });
       return `msg-${sent.length}`;
     },
     async updateCard(messageId: string, state: CardState) {
       updated.push({ messageId, state });
       return true;
     },
-    async sendQuestionCard(chatId: string, state: CardState, replyTo?: unknown) {
-      sent.push({ chatId, state, replyTo });
+    async sendQuestionCard(chatId: string, state: CardState) {
+      sent.push({ chatId, state });
       return `qmsg-${sent.length}`;
     },
     async updateQuestionCard(messageId: string, state: CardState) {
       updated.push({ messageId, state });
       return true;
     },
-    async sendTextNotice(chatId: string, title: string, content: string, color?: string, replyTo?: unknown) {
-      notices.push({ chatId, title, content, color, replyTo });
-    },
+    async sendTextNotice() {},
     async sendText() {},
     async sendImageFile() { return true; },
     async sendLocalFile() { return true; },
@@ -332,93 +328,6 @@ describe('MessageBridge between-turn questions', () => {
   });
 });
 
-/**
- * [本地私改·patch I] 话题（thread/topic）回复路由 — bridge 层。
- *
- * 锁定两条规则：
- *   1. 排队合并（patch C）不得跨话题：同一人在两个话题里的消息各排各的，
- *      各自的排队/合并通知回复到各自的触发消息（落各自话题）。
- *   2. 跨轮提问卡沿用任务的话题锚点（粘性 threadAnchors），话题任务的
- *      提问卡落回话题而不是群主界面。
- */
-describe('MessageBridge thread reply routing (patch I)', () => {
-  function fakeRunningTask() {
-    return { executionHandle: { finish() {} }, abortController: new AbortController() };
-  }
-
-  it('does not merge queued messages from different threads; each queue notice replies to its own message', async () => {
-    const sender = makeSender();
-    const bridge = new MessageBridge(makeConfig(), mockLogger, sender as any) as any;
-    bridge.runningTasks.set('chat-1', fakeRunningTask());
-
-    await bridge.handleMessage({ messageId: 'm1', chatId: 'chat-1', chatType: 'group', userId: 'u1', threadId: 'th_1', text: 'first task' });
-    await bridge.handleMessage({ messageId: 'm2', chatId: 'chat-1', chatType: 'group', userId: 'u1', threadId: 'th_2', text: 'second task' });
-    await bridge.handleMessage({ messageId: 'm3', chatId: 'chat-1', chatType: 'group', userId: 'u1', threadId: 'th_2', text: 'more detail' });
-
-    const queue = bridge.messageQueues.get('chat-1');
-    expect(queue).toHaveLength(2); // th_1 kept separate; m3 merged into the th_2 tail
-    expect(queue[1].threadId).toBe('th_2');
-    expect(queue[1].text).toContain('second task');
-    expect(queue[1].text).toContain('more detail');
-
-    expect(sender.notices.map((n) => n.title)).toEqual(['📋 Queued', '📋 Queued', '📋 Merged']);
-    expect(sender.notices[0].replyTo).toEqual({ messageId: 'm1', inThread: true });
-    expect(sender.notices[1].replyTo).toEqual({ messageId: 'm2', inThread: true });
-    expect(sender.notices[2].replyTo).toEqual({ messageId: 'm3', inThread: true });
-
-    bridge.runningTasks.delete('chat-1');
-    bridge.destroy();
-  });
-
-  it('main-chat messages (no threadId) still merge and their notices carry no replyTo (regression)', async () => {
-    const sender = makeSender();
-    const bridge = new MessageBridge(makeConfig(), mockLogger, sender as any) as any;
-    bridge.runningTasks.set('chat-1', fakeRunningTask());
-
-    await bridge.handleMessage({ messageId: 'm1', chatId: 'chat-1', chatType: 'group', userId: 'u1', text: 'first' });
-    await bridge.handleMessage({ messageId: 'm2', chatId: 'chat-1', chatType: 'group', userId: 'u1', text: 'second' });
-
-    expect(bridge.messageQueues.get('chat-1')).toHaveLength(1); // merged as before
-    expect(sender.notices.map((n) => n.title)).toEqual(['📋 Queued', '📋 Merged']);
-    expect(sender.notices[0].replyTo).toBeUndefined();
-    expect(sender.notices[1].replyTo).toBeUndefined();
-
-    bridge.runningTasks.delete('chat-1');
-    bridge.destroy();
-  });
-
-  it('between-turn question card replies into the sticky thread anchor', async () => {
-    const sender = makeSender();
-    const bridge = new MessageBridge(makeConfig(), mockLogger, sender as any) as any;
-    bridge.persistentRegistry = { peek: () => ({ resolveQuestion: () => {} }), shutdownAll: async () => {} };
-    bridge.threadAnchors.set('chat-1', { messageId: 'om_root', threadId: 'th_1' });
-
-    await bridge.handleBetweenTurnQuestion('chat-1', {
-      toolUseId: 'toolu_thread',
-      questions: [{
-        question: 'Proceed?',
-        header: 'Confirm',
-        options: [{ label: 'Yes', description: '' }, { label: 'No', description: '' }],
-        multiSelect: false,
-      }],
-    });
-
-    expect(sender.sent).toHaveLength(1);
-    expect(sender.sent[0].replyTo).toEqual({ messageId: 'om_root', inThread: true });
-
-    bridge.destroy();
-  });
-
-  it('replyTargetFor returns undefined without an anchor (main-chat tasks unchanged)', () => {
-    const sender = makeSender();
-    const bridge = new MessageBridge(makeConfig(), mockLogger, sender as any) as any;
-    expect(bridge.replyTargetFor('chat-1')).toBeUndefined();
-    bridge.threadAnchors.set('chat-1', { messageId: 'om_root', threadId: 'th_1' });
-    expect(bridge.replyTargetFor('chat-1')).toEqual({ messageId: 'om_root', inThread: true });
-    bridge.destroy();
-  });
-});
-
 describe('MessageBridge chatId cleanup (memory leak guard)', () => {
   it('sweepStaleChatIdEntries evicts only entries older than the TTL', () => {
     const sender = makeSender();
@@ -445,7 +354,6 @@ describe('MessageBridge chatId cleanup (memory leak guard)', () => {
     bridge.exitPlanCardsShown.add('chat-1');
     bridge.spontaneousSubscribed.add('chat-1');
     bridge.messageQueues.set('chat-1', []);
-    bridge.threadAnchors.set('chat-1', { messageId: 'om_root', threadId: 'th_1' }); // [本地私改·patch I]
     const clearedTimers: Array<ReturnType<typeof setTimeout>> = [];
     const bufTimer = setTimeout(() => {}, 60_000);
     bridge.spontaneousBuffers.set('chat-1', { teamState: { teammates: [], tasks: [] }, snippets: [], timer: bufTimer });
@@ -465,7 +373,6 @@ describe('MessageBridge chatId cleanup (memory leak guard)', () => {
     expect(bridge.spontaneousBuffers.size).toBe(0);
     expect(bridge.pendingBetweenTurnQuestions.size).toBe(0);
     expect(bridge.messageQueues.size).toBe(0);
-    expect(bridge.threadAnchors.size).toBe(0); // [本地私改·patch I]
     expect(bridge.chatIdCleanupTimer).toBeUndefined();
 
     clearTimeout(bufTimer);

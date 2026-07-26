@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import type * as lark from '@larksuiteoapi/node-sdk';
 import type { Logger } from '../utils/logger.js';
-import type { DownloadOutcome, ReplyTarget } from '../bridge/message-sender.interface.js';
+import type { DownloadOutcome } from '../bridge/message-sender.interface.js';
 
 /**
  * [本地私改·patch G] 出站脱敏：飞书对话里不透露本机真实路径与密钥。
@@ -168,39 +168,8 @@ export class MessageSender {
     private logger: Logger,
   ) {}
 
-  /**
-   * [本地私改·patch I] 以回复形式发消息，用于把输出锚定进话题（thread）。
-   * 回复话题内的消息即落话题；inThread 时显式带 reply_in_thread。
-   * 失败（锚点消息被撤回/过期等）返回 undefined，由调用方回退普通 create 保底。
-   */
-  private async replyMessage(replyTo: ReplyTarget, content: string, msgType: string): Promise<string | undefined> {
-    try {
-      const resp = await this.client.im.v1.message.reply({
-        path: { message_id: replyTo.messageId },
-        data: {
-          content,
-          msg_type: msgType,
-          ...(replyTo.inThread ? { reply_in_thread: true } : {}),
-        },
-      });
-      const messageId = resp?.data?.message_id;
-      if (!messageId) {
-        this.logger.warn({ resp, replyTo, msgType }, 'Reply send returned no message_id, falling back to create');
-      }
-      return messageId;
-    } catch (err) {
-      this.logger.warn({ err, replyTo, msgType }, 'Reply send failed, falling back to create');
-      return undefined;
-    }
-  }
-
-  async sendCard(chatId: string, cardContent: string, replyTo?: ReplyTarget): Promise<string | undefined> {
+  async sendCard(chatId: string, cardContent: string): Promise<string | undefined> {
     const safeContent = redactSensitive(cardContent); // [本地私改·patch G] 出站脱敏
-    // [本地私改·patch I] 话题内触发的任务：卡片以回复形式创建，落回话题；失败回退主聊天
-    if (replyTo) {
-      const messageId = await this.replyMessage(replyTo, safeContent, 'interactive');
-      if (messageId) return messageId;
-    }
     try {
       const resp = await this.client.im.v1.message.create({
         params: { receive_id_type: 'chat_id' },
@@ -432,15 +401,13 @@ export class MessageSender {
     return undefined;
   }
 
-  async sendImage(chatId: string, imageKey: string, replyTo?: ReplyTarget): Promise<boolean> {
-    const content = JSON.stringify({ image_key: imageKey });
-    if (replyTo && await this.replyMessage(replyTo, content, 'image')) return true; // [本地私改·patch I]
+  async sendImage(chatId: string, imageKey: string): Promise<boolean> {
     try {
       await this.client.im.v1.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
-          content,
+          content: JSON.stringify({ image_key: imageKey }),
           msg_type: 'image',
         },
       });
@@ -451,10 +418,10 @@ export class MessageSender {
     }
   }
 
-  async sendImageFile(chatId: string, filePath: string, replyTo?: ReplyTarget): Promise<boolean> {
+  async sendImageFile(chatId: string, filePath: string): Promise<boolean> {
     const imageKey = await this.uploadImage(filePath);
     if (!imageKey) return false;
-    return this.sendImage(chatId, imageKey, replyTo);
+    return this.sendImage(chatId, imageKey);
   }
 
   async uploadFile(filePath: string, fileName: string, fileType: string): Promise<string | undefined> {
@@ -489,15 +456,13 @@ export class MessageSender {
     return undefined;
   }
 
-  async sendFile(chatId: string, fileKey: string, replyTo?: ReplyTarget): Promise<boolean> {
-    const content = JSON.stringify({ file_key: fileKey });
-    if (replyTo && await this.replyMessage(replyTo, content, 'file')) return true; // [本地私改·patch I]
+  async sendFile(chatId: string, fileKey: string): Promise<boolean> {
     try {
       await this.client.im.v1.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
-          content,
+          content: JSON.stringify({ file_key: fileKey }),
           msg_type: 'file',
         },
       });
@@ -508,21 +473,19 @@ export class MessageSender {
     }
   }
 
-  async sendLocalFile(chatId: string, filePath: string, fileName: string, fileType: string, replyTo?: ReplyTarget): Promise<boolean> {
+  async sendLocalFile(chatId: string, filePath: string, fileName: string, fileType: string): Promise<boolean> {
     const fileKey = await this.uploadFile(filePath, fileName, fileType);
     if (!fileKey) return false;
-    return this.sendFile(chatId, fileKey, replyTo);
+    return this.sendFile(chatId, fileKey);
   }
 
-  async sendAudio(chatId: string, fileKey: string, replyTo?: ReplyTarget): Promise<boolean> {
-    const content = JSON.stringify({ file_key: fileKey });
-    if (replyTo && await this.replyMessage(replyTo, content, 'audio')) return true; // [本地私改·patch I]
+  async sendAudio(chatId: string, fileKey: string): Promise<boolean> {
     try {
       await this.client.im.v1.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
-          content,
+          content: JSON.stringify({ file_key: fileKey }),
           msg_type: 'audio',
         },
       });
@@ -533,10 +496,10 @@ export class MessageSender {
     }
   }
 
-  async sendAudioFile(chatId: string, filePath: string, fileName: string, replyTo?: ReplyTarget): Promise<boolean> {
+  async sendAudioFile(chatId: string, filePath: string, fileName: string): Promise<boolean> {
     const fileKey = await this.uploadFile(filePath, fileName, 'opus');
     if (!fileKey) return false;
-    return this.sendAudio(chatId, fileKey, replyTo);
+    return this.sendAudio(chatId, fileKey);
   }
 
   async getChatMemberCount(chatId: string): Promise<number | undefined> {

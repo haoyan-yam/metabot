@@ -105,7 +105,7 @@ describe('sendCompletionNotice', () => {
       durationMs: 10_000,
     });
 
-    // [本地私改·patch D/I] sendText 第 3 参是可选 replyToMessageId；未传时为 undefined
+    // [本地私改·patch D] sendText 第 3 参是可选 replyToMessageId；未传时为 undefined
     expect(sender.sendText).toHaveBeenCalledWith('chat', '✅ Done', undefined);
   });
 
@@ -120,79 +120,8 @@ describe('sendCompletionNotice', () => {
       durationMs: 10_000,
     });
 
-    // [本地私改·patch D/I] 同上：断言带上可选第 3 参
+    // [本地私改·patch D] 同上：断言带上可选第 3 参
     expect(sender.sendText).toHaveBeenCalledWith('chat', '❌ Failed', undefined);
-  });
-
-  // [本地私改·patch J] 话题任务：完成通知 @ 发起人，且不受 10s 免打扰门槛限制。
-  it('thread tasks get the notice with an @-mention even under 10s (patch J)', async () => {
-    const sender = makeSender();
-    await sendCompletionNotice({
-      sender,
-      config: makeConfig(),
-      logger: { warn: vi.fn() } as any,
-      chatId: 'chat',
-      state: makeState('complete'),
-      durationMs: 1_000,
-      replyToMessageId: 'om_trigger',
-      threadNotice: { atUserId: 'ou_requester' },
-    });
-
-    expect(sender.sendText).toHaveBeenCalledWith(
-      'chat',
-      '<at user_id="ou_requester"></at> ✅ Done',
-      'om_trigger',
-    );
-  });
-
-  it('thread tasks over 10s also carry the @-mention (patch J)', async () => {
-    const sender = makeSender();
-    await sendCompletionNotice({
-      sender,
-      config: makeConfig(),
-      logger: { warn: vi.fn() } as any,
-      chatId: 'chat',
-      state: makeState('error'),
-      durationMs: 60_000,
-      replyToMessageId: 'om_trigger',
-      threadNotice: { atUserId: 'ou_requester' },
-    });
-
-    expect(sender.sendText).toHaveBeenCalledWith(
-      'chat',
-      '<at user_id="ou_requester"></at> ❌ Failed',
-      'om_trigger',
-    );
-  });
-
-  it('non-thread short tasks are still skipped (patch J regression)', async () => {
-    const sender = makeSender();
-    await sendCompletionNotice({
-      sender,
-      config: makeConfig(),
-      logger: { warn: vi.fn() } as any,
-      chatId: 'chat',
-      state: makeState('complete'),
-      durationMs: 9_999,
-      replyToMessageId: 'om_trigger',
-    });
-
-    expect(sender.sendText).not.toHaveBeenCalled();
-  });
-
-  it('voice-reply bots still skip the notice for successful thread tasks (patch J keeps the voice gate)', async () => {
-    const sender = makeSender();
-    await sendCompletionNotice({
-      sender,
-      config: makeConfig({ voiceReply: { enabled: true } }),
-      logger: { warn: vi.fn() } as any,
-      chatId: 'chat',
-      state: makeState('complete'),
-      durationMs: 60_000,
-      threadNotice: { atUserId: 'ou_requester' },
-    });
-
-    expect(sender.sendText).not.toHaveBeenCalled();
   });
 
   it('logs and swallows send failures', async () => {

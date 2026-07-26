@@ -189,8 +189,6 @@ export function createEventDispatcher(
         const chatId = message.chat_id;
         const chatType = message.chat_type;
         const messageId = message.message_id;
-        const threadId = message.thread_id; // [本地私改·patch I] 话题内消息带 thread_id，回复须落回话题
-
 
         // Dedup: Feishu retries delivery if we respond slowly (e.g. during a
         // long task). Mark this messageId as seen up-front so retries are dropped.
@@ -352,7 +350,7 @@ export function createEventDispatcher(
           }
         }
 
-        onMessage({ messageId, chatId, chatType, userId, threadId, text, imageKey, fileKey, fileName, extraMedia });
+        onMessage({ messageId, chatId, chatType, userId, text, imageKey, fileKey, fileName, extraMedia });
       } catch (err) {
         logger.error({ err }, 'Error handling message event');
       }

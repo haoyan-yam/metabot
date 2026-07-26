@@ -82,7 +82,7 @@ index f218703..ff01dcd 100644
 +    return undefined;
    }
  
-   async sendImage(chatId: string, imageKey: string, replyTo?: ReplyTarget): Promise<boolean> {
+   async sendImage(chatId: string, imageKey: string): Promise<boolean> {
 @@ -204,23 +241,35 @@ export class MessageSender {
    }
  
@@ -133,4 +133,4 @@ index f218703..ff01dcd 100644
 +    return undefined;
    }
  
-   async sendFile(chatId: string, fileKey: string, replyTo?: ReplyTarget): Promise<boolean> {
+   async sendFile(chatId: string, fileKey: string): Promise<boolean> {

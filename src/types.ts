@@ -97,8 +97,6 @@ export interface IncomingMessage {
   chatId: string;
   chatType: string;
   userId: string;
-  /** [本地私改·patch I] 飞书话题(topic/thread) id；消息发自话题内时存在，回复需锚定到话题。 */
-  threadId?: string;
   text: string;
   timestamp?: number;
   imageKey?: string;

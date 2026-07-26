@@ -1,13 +1,13 @@
 diff --git a/src/bridge/message-bridge.ts b/src/bridge/message-bridge.ts
-index fc912ca..e417df9 100644
+index 8b7d4ef..1f40b88 100644
 --- a/src/bridge/message-bridge.ts
 +++ b/src/bridge/message-bridge.ts
 @@ -4,7 +4,7 @@ import * as path from 'node:path';
  import type { BotConfigBase } from '../config.js';
  import type { Logger } from '../utils/logger.js';
  import type { BackgroundEvent, IncomingMessage, CardState, PendingQuestion, TeamState, TeamMember, TeamTask } from '../types.js';
--import type { IMessageSender, ReplyTarget } from './message-sender.interface.js';
-+import type { DownloadOutcome, IMessageSender, ReplyTarget } from './message-sender.interface.js';
+-import type { IMessageSender } from './message-sender.interface.js';
++import type { DownloadOutcome, IMessageSender } from './message-sender.interface.js';
  import type { DocSync } from '../sync/doc-sync.js';
  import type {
    Engine,
@@ -23,7 +23,7 @@ index fc912ca..e417df9 100644
  const TASK_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24 hours
  const QUESTION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes for user to answer
  /**
-@@ -1985,54 +1990,69 @@ export class MessageBridge {
+@@ -1951,54 +1956,69 @@ export class MessageBridge {
      fs.mkdirSync(downloadsDir, { recursive: true });
  
      // Handle image download if present
@@ -104,12 +104,11 @@ index fc912ca..e417df9 100644
  
      // Prepare per-chat outputs directory
 diff --git a/src/bridge/message-sender.interface.ts b/src/bridge/message-sender.interface.ts
-index d4762fd..f4b6b7b 100644
+index 973292a..4668e6c 100644
 --- a/src/bridge/message-sender.interface.ts
 +++ b/src/bridge/message-sender.interface.ts
-@@ -18,6 +18,20 @@ export interface ReplyTarget {
-   inThread?: boolean;
- }
+@@ -1,5 +1,19 @@
+ import type { CardState } from '../types.js';
  
 +/**
 + * [本地私改·patch N] Download outcome for user-sent attachments.
@@ -128,9 +127,9 @@ index d4762fd..f4b6b7b 100644
  /**
   * Platform-agnostic message sender interface.
   * Implemented by each IM platform (Feishu, Telegram, etc.).
-@@ -78,11 +92,11 @@ export interface IMessageSender {
+@@ -57,11 +71,11 @@ export interface IMessageSender {
    /** Send a local audio file as a native voice/audio message, when supported. */
-   sendAudioFile?(chatId: string, filePath: string, fileName?: string, replyTo?: ReplyTarget): Promise<boolean>;
+   sendAudioFile?(chatId: string, filePath: string, fileName?: string): Promise<boolean>;
  
 -  /** Download a user-sent image to a local path. */
 -  downloadImage(messageId: string, imageKey: string, savePath: string): Promise<boolean>;
@@ -145,7 +144,7 @@ index d4762fd..f4b6b7b 100644
    /** If true, the bridge will not send a separate "Task completed" text after the card update. */
    skipCompletionNotice?: boolean;
 diff --git a/src/feishu/event-handler.ts b/src/feishu/event-handler.ts
-index 5fa6add..5b78645 100644
+index d2de163..ba3f64e 100644
 --- a/src/feishu/event-handler.ts
 +++ b/src/feishu/event-handler.ts
 @@ -26,7 +26,12 @@ const memberCountCache = new Map<string, { count: number; ts: number }>();
@@ -198,7 +197,7 @@ index 5fa6add..5b78645 100644
    if (valid.length === 0) {
      pendingMediaCache.delete(key);
      return [];
-@@ -205,10 +232,7 @@ export function createEventDispatcher(
+@@ -203,10 +230,7 @@ export function createEventDispatcher(
                // Cache media messages for later retrieval when user @mentions bot
                const media = parseMediaMessage(message, msgType, logger);
                if (media) {
@@ -210,7 +209,7 @@ index 5fa6add..5b78645 100644
                  logger.info({ chatId, userId, msgType, ...media }, 'Cached group media for later @mention');
                }
                return;
-@@ -314,7 +338,7 @@ export function createEventDispatcher(
+@@ -312,7 +336,7 @@ export function createEventDispatcher(
            logger.info({ chatId, postExtraImageCount: postExtraImages.length }, 'Attached extra images from post');
          }
          if (chatType === 'group') {
@@ -220,18 +219,18 @@ index 5fa6add..5b78645 100644
              const cachedMedia = cached.map(m => ({
                messageId: m.messageId,
 diff --git a/src/feishu/feishu-sender-adapter.ts b/src/feishu/feishu-sender-adapter.ts
-index 488a7ac..643457a 100644
+index b484e90..880de79 100644
 --- a/src/feishu/feishu-sender-adapter.ts
 +++ b/src/feishu/feishu-sender-adapter.ts
 @@ -1,5 +1,5 @@
  import * as path from 'node:path';
--import type { IMessageSender, ReplyTarget } from '../bridge/message-sender.interface.js';
-+import type { DownloadOutcome, IMessageSender, ReplyTarget } from '../bridge/message-sender.interface.js';
+-import type { IMessageSender } from '../bridge/message-sender.interface.js';
++import type { DownloadOutcome, IMessageSender } from '../bridge/message-sender.interface.js';
  import type { CardState } from '../types.js';
  import { MessageSender } from './message-sender.js';
  import { buildCard, buildTextCard } from './card-builder.js';
 @@ -70,11 +70,11 @@ export class FeishuSenderAdapter implements IMessageSender {
-     return this.sender.sendAudioFile(chatId, filePath, fileName ?? path.basename(filePath), replyTo);
+     return this.sender.sendAudioFile(chatId, filePath, fileName ?? path.basename(filePath));
    }
  
 -  async downloadImage(messageId: string, imageKey: string, savePath: string): Promise<boolean> {
@@ -245,19 +244,18 @@ index 488a7ac..643457a 100644
    }
  }
 diff --git a/src/feishu/message-sender.ts b/src/feishu/message-sender.ts
-index 1289f22..b3e1bb2 100644
+index 22f6921..90e1473 100644
 --- a/src/feishu/message-sender.ts
 +++ b/src/feishu/message-sender.ts
-@@ -1,7 +1,7 @@
+@@ -1,6 +1,7 @@
  import * as fs from 'node:fs';
  import type * as lark from '@larksuiteoapi/node-sdk';
  import type { Logger } from '../utils/logger.js';
--import type { ReplyTarget } from '../bridge/message-sender.interface.js';
-+import type { DownloadOutcome, ReplyTarget } from '../bridge/message-sender.interface.js';
++import type { DownloadOutcome } from '../bridge/message-sender.interface.js';
  
  /**
   * [本地私改·patch G] 出站脱敏：飞书对话里不透露本机真实路径与密钥。
-@@ -70,6 +70,98 @@ async function withUploadTimeout<T>(p: Promise<T>, label: string): Promise<T> {
+@@ -69,6 +70,98 @@ async function withUploadTimeout<T>(p: Promise<T>, label: string): Promise<T> {
    finally { if (timer) clearTimeout(timer); }
  }
  
@@ -356,7 +354,7 @@ index 1289f22..b3e1bb2 100644
  export class MessageSender {
    constructor(
      private client: lark.Client,
-@@ -144,43 +236,168 @@ export class MessageSender {
+@@ -112,43 +205,168 @@ export class MessageSender {
      }
    }
  
