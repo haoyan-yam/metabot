@@ -1,4 +1,5 @@
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 import type { Logger } from '../utils/logger.js';
 import type { CardState } from '../types.js';
 import type { IMessageSender } from './message-sender.interface.js';
@@ -22,6 +23,8 @@ interface OversizedFile {
   fileName:  string;
   sizeBytes: number;
   isImage:   boolean;
+  /** [本地私改·补丁 Q] 若位于发送目录内,通知发出后删除,防每轮重复通知 */
+  filePath?: string;
 }
 
 function formatBytes(bytes: number): string {
@@ -37,24 +40,58 @@ export class OutputHandler {
     private outputsManager: OutputsManager,
   ) {}
 
-  async sendOutputFiles(
+  // [本地私改·补丁 Q] per-chat 发送互斥链:轮末扫描 / spontaneous 补扫 / 开轮兜底 /
+  // 延迟清理前置补扫可能并发扫同一目录,串行化后配合"发过即删"物理上杜绝双发。
+  private sendChains = new Map<string, Promise<void>>();
+
+  private runExclusive<T>(chatId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.sendChains.get(chatId) ?? Promise.resolve();
+    const run = prev.then(fn, fn);
+    const tail = run.then(() => undefined, () => undefined);
+    this.sendChains.set(chatId, tail);
+    void tail.then(() => {
+      if (this.sendChains.get(chatId) === tail) this.sendChains.delete(chatId);
+    });
+    return run;
+  }
+
+  /** [本地私改·补丁 Q] p 是否位于 dir 之内(防误删发送目录外的工作区文件)。 */
+  private isInsideDir(dir: string, p: string): boolean {
+    const rel = path.relative(dir, p);
+    return !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+  }
+
+  private tryUnlink(p: string): void {
+    try { fs.unlinkSync(p); } catch { /* ignore */ }
+  }
+
+  /** [本地私改·补丁 Q] 通知发出后删除仍留在发送目录内的超限/失败文件,防每轮重复通知。 */
+  private deleteNoticedLeftovers(outputsDir: string, entries: { filePath?: string }[]): void {
+    for (const e of entries) {
+      if (e.filePath && this.isInsideDir(outputsDir, e.filePath)) this.tryUnlink(e.filePath);
+    }
+  }
+
+  /**
+   * [本地私改·补丁 Q] 发送目录扫描 + 逐个发送。发送成功的文件**立即删除** ——
+   * 建立不变量「目录里还有 = 一定没发过」,所有发送入口由此天然免疫重复发送。
+   * 供 sendOutputFiles(轮末)与 sweepDir(补扫)共用。调用方须已持有 runExclusive。
+   */
+  private async sendDirFilesLocked(
     chatId: string,
     outputsDir: string,
-    processor: StreamProcessor,
-    state: CardState,
+    sentPaths: Set<string>,
+    oversized: OversizedFile[],
+    failedSends: { fileName: string; isImage: boolean; filePath?: string }[],
   ): Promise<void> {
-    const sentPaths = new Set<string>();
-    const oversized: OversizedFile[] = [];
-    const failedSends: { fileName: string; isImage: boolean }[] = []; // [本地私改·patch L] 经 K 重试仍失败的
-
-    // 1. Scan the outputs directory for any files the agent placed there
     const outputFiles = this.outputsManager.scanOutputs(outputsDir);
     for (const file of outputFiles) {
       try {
         if (file.isImage && file.sizeBytes <= IMAGE_MAX_BYTES) {
           this.logger.info({ filePath: file.filePath }, 'Sending output image from outputs dir');
           const ok = await this.sender.sendImageFile(chatId, file.filePath);
-          if (!ok) failedSends.push({ fileName: file.fileName, isImage: true }); // [本地私改·patch L]
+          if (!ok) failedSends.push({ fileName: file.fileName, isImage: true, filePath: file.filePath }); // [本地私改·patch L]
+          else this.tryUnlink(file.filePath); // [本地私改·补丁 Q] 发过即删
         } else if (!file.isImage && file.sizeBytes <= FILE_MAX_BYTES) {
           this.logger.info({ filePath: file.filePath }, 'Sending output file from outputs dir');
           const sent = await this.sender.sendLocalFile(chatId, file.filePath, file.fileName);
@@ -64,22 +101,59 @@ export class OutputHandler {
               this.logger.info({ filePath: file.filePath }, 'File upload failed, sending as text message');
               const content = fs.readFileSync(file.filePath, 'utf-8');
               await this.sender.sendText(chatId, `📄 ${file.fileName}\n\n${content}`);
+              this.tryUnlink(file.filePath); // [本地私改·补丁 Q] 已投递,同删
             } else {
               // [本地私改·patch L] 经 K 重试仍失败、又没走文本兜底 → 记下，末尾统一告知，不再静默丢
-              failedSends.push({ fileName: file.fileName, isImage: false });
+              failedSends.push({ fileName: file.fileName, isImage: false, filePath: file.filePath });
             }
+          } else {
+            this.tryUnlink(file.filePath); // [本地私改·补丁 Q] 发过即删
           }
         } else {
           // Track for a single end-of-batch notice so users know files exist
           // but were dropped — silently logging warn was the original bug.
           this.logger.warn({ filePath: file.filePath, sizeBytes: file.sizeBytes }, 'Output file too large to send');
-          oversized.push({ fileName: file.fileName, sizeBytes: file.sizeBytes, isImage: file.isImage });
+          oversized.push({ fileName: file.fileName, sizeBytes: file.sizeBytes, isImage: file.isImage, filePath: file.filePath });
         }
         sentPaths.add(file.filePath);
       } catch (err) {
         this.logger.warn({ err, filePath: file.filePath }, 'Failed to send output file');
       }
     }
+  }
+
+  /**
+   * [本地私改·补丁 Q] 纯目录补扫:把发送目录里残留(=未发送)的文件发出并删除。
+   * 不做正文/processor fallback(避免把正文提到的归档路径重发)。
+   * 入口:spontaneous 卡片后、开轮 prepareDir 前、延迟清理 rm 前。
+   */
+  async sweepDir(chatId: string, outputsDir: string | null): Promise<void> {
+    if (!outputsDir) return;
+    return this.runExclusive(chatId, async () => {
+      const sentPaths = new Set<string>();
+      const oversized: OversizedFile[] = [];
+      const failedSends: { fileName: string; isImage: boolean; filePath?: string }[] = [];
+      await this.sendDirFilesLocked(chatId, outputsDir, sentPaths, oversized, failedSends);
+      if (oversized.length > 0) await this.sendOversizedNotice(chatId, oversized);
+      if (failedSends.length > 0) await this.sendFailedNotice(chatId, failedSends);
+      this.deleteNoticedLeftovers(outputsDir, [...oversized, ...failedSends]);
+    });
+  }
+
+  async sendOutputFiles(
+    chatId: string,
+    outputsDir: string,
+    processor: StreamProcessor,
+    state: CardState,
+  ): Promise<void> {
+    return this.runExclusive(chatId, async () => { // [本地私改·补丁 Q] 互斥
+    const sentPaths = new Set<string>();
+    const oversized: OversizedFile[] = [];
+    const failedSends: { fileName: string; isImage: boolean; filePath?: string }[] = []; // [本地私改·patch L] 经 K 重试仍失败的
+
+    // 1. Scan the outputs directory for any files the agent placed there
+    //    [本地私改·补丁 Q] 逻辑提取到 sendDirFilesLocked(发过即删),与补扫共用
+    await this.sendDirFilesLocked(chatId, outputsDir, sentPaths, oversized, failedSends);
 
     // 2. Fallback: send images detected via old method (Write tool tracking + response text scanning)
     const imagePaths = new Set<string>(processor.getImagePaths());
@@ -98,11 +172,14 @@ export class OutputHandler {
           if (size <= IMAGE_MAX_BYTES) {
             this.logger.info({ imgPath }, 'Sending output image (fallback)');
             const ok = await this.sender.sendImageFile(chatId, imgPath);
-            if (!ok) failedSends.push({ fileName: imgPath.split('/').pop() ?? imgPath, isImage: true }); // [本地私改·patch L]
+            if (!ok) failedSends.push({ fileName: imgPath.split('/').pop() ?? imgPath, isImage: true, filePath: imgPath }); // [本地私改·patch L]
+            // [本地私改·补丁 Q] fallback 命中的文件若位于发送目录内(扩展名未被
+            // scanOutputs 识别的边角),发过同删 —— 否则会被后续补扫当文件重发。
+            else if (this.isInsideDir(outputsDir, imgPath)) this.tryUnlink(imgPath);
           } else {
             // Same notice path as the outputs-dir scan — match user-visible behaviour.
             this.logger.warn({ imgPath, sizeBytes: size }, 'Fallback output image too large to send');
-            oversized.push({ fileName: imgPath.split('/').pop() ?? imgPath, sizeBytes: size, isImage: true });
+            oversized.push({ fileName: imgPath.split('/').pop() ?? imgPath, sizeBytes: size, isImage: true, filePath: imgPath });
           }
         }
       } catch (err) {
@@ -122,6 +199,10 @@ export class OutputHandler {
     if (failedSends.length > 0) {
       await this.sendFailedNotice(chatId, failedSends);
     }
+
+    // 5. [本地私改·补丁 Q] 通知完删除发送目录内的超限/失败残留,防下轮重复通知/重发。
+    this.deleteNoticedLeftovers(outputsDir, [...oversized, ...failedSends]);
+    }); // [本地私改·补丁 Q] 互斥结束
   }
 
   /**

@@ -115,10 +115,20 @@ export class OutputsManager {
 
     const timer = setTimeout(() => {
       this.pendingCleanups.delete(outputsDir);
-      try {
-        fs.rmSync(outputsDir, { recursive: true, force: true });
-        this.logger.debug({ outputsDir }, 'Cleaned up outputs directory (deferred)');
-      } catch { /* ignore */ }
+      // [本地私改·补丁 Q] rm 前先补扫:发送成功的文件已被即删(见 output-handler),
+      // 目录里若还有文件 = 一定没发出去(如后台生图晚落盘)。先交给 sweeper 发送,
+      // 再删目录 —— 否则迟到产物会被这里静默销毁(2026-07-30 事故的删除点之一)。
+      const doRemove = () => {
+        try {
+          fs.rmSync(outputsDir, { recursive: true, force: true });
+          this.logger.debug({ outputsDir }, 'Cleaned up outputs directory (deferred)');
+        } catch { /* ignore */ }
+      };
+      if (this.sweeper) {
+        void this.sweeper(outputsDir).then(doRemove, doRemove);
+      } else {
+        doRemove();
+      }
     }, RETENTION_MS);
 
     // Don't let the timer keep the process alive
@@ -126,6 +136,23 @@ export class OutputsManager {
 
     this.pendingCleanups.set(outputsDir, timer);
     this.logger.debug({ outputsDir, retentionMs: RETENTION_MS }, 'Scheduled deferred outputs cleanup');
+  }
+
+  // ---- [本地私改·补丁 Q] 漏发补扫支持 ----
+
+  /** 补扫回调:延迟清理 rm 前把目录里未发送的文件先发出去。由 bridge 启动时注册。 */
+  private sweeper?: (outputsDir: string) => Promise<void>;
+
+  setSweeper(fn: (outputsDir: string) => Promise<void>): void {
+    this.sweeper = fn;
+  }
+
+  /** 只解析 chatId 对应的目录路径,不建目录、不清文件(prepareDir 的无副作用版,供补扫用)。 */
+  dirFor(chatId: string): string | null {
+    const root = path.resolve(this.baseDir);
+    const dir = resolveWithinRoot(root, chatId);
+    if (!dir || dir === root) return null;
+    return dir;
   }
 
   /** Check if a file extension is a text-based format that can be sent as text. */

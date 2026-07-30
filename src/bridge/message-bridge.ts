@@ -304,6 +304,9 @@ export class MessageBridge {
     );
 
     this.outputHandler = new OutputHandler(logger, sender, this.outputsManager);
+    // [本地私改·补丁 Q] 延迟清理 rm 前先补扫发送(目录名即 chatId)——
+    // 后台任务晚落盘的产物不再被 5 分钟定时 rmSync 静默销毁(2026-07-30 事故)。
+    this.outputsManager.setSweeper((dir) => this.outputHandler.sweepDir(path.basename(dir), dir));
     this.codexCommands = new CodexCommandController({
       config,
       logger,
@@ -1061,11 +1064,24 @@ export class MessageBridge {
       return;
     }
 
+    // [本地私改·补丁 Q] spontaneous 活动常伴随后台任务(如慢速生图)把产物 cp 进
+    // 发送目录 —— 而本路径原本从不发送文件,产物静躺目录直到被清空/rmSync 销毁
+    // (2026-07-30 生产事故:四批后台生成图静默丢失的主因)。卡片后补扫一遍,
+    // 落盘即发;纯 tool burst(无可展示片段)同样要扫 —— cp 恰恰就是纯 tool 活动。
+    const sweepOutputs = async () => {
+      try {
+        await this.outputHandler.sweepDir(chatId, this.outputsManager.dirFor(chatId));
+      } catch (err) {
+        this.logger.warn({ err, chatId }, 'MessageBridge: spontaneous outputs sweep failed');
+      }
+    };
+
     // Nothing user-meaningful to surface — buffer might exist because a
     // teammate ping landed but extractSpontaneousSnippet filtered all of
     // its blocks (e.g. tool-only burst). Silently skip the card.
     if (buf.snippets.length === 0) {
       this.logger.debug({ chatId }, 'MessageBridge: drop spontaneous (no text snippets)');
+      await sweepOutputs(); // [本地私改·补丁 Q]
       return;
     }
 
@@ -1084,6 +1100,7 @@ export class MessageBridge {
     } catch (err) {
       this.logger.warn({ err, chatId }, 'MessageBridge: failed to send spontaneous card');
     }
+    await sweepOutputs(); // [本地私改·补丁 Q] 卡片先行,产物紧随
   }
 
   /**
@@ -1162,6 +1179,8 @@ export class MessageBridge {
     this.logger.info({ chatId, messageId }, 'MessageBridge: continuation card opened');
 
     let lastState: CardState = initialState;
+    // [本地私改·补丁 Q] 清空前先补扫:残留 = 漏发文件(发过即删),先发出去再清
+    await this.outputHandler.sweepDir(chatId, this.outputsManager.dirFor(chatId));
     const outputsDir = this.outputsManager.prepareDir(chatId);
     // Set of pending AskUserQuestion toolUseIds we've already surfaced on
     // this stream — prevents re-sending the question card on every delta
@@ -2027,6 +2046,8 @@ export class MessageBridge {
     }
 
     // Prepare per-chat outputs directory
+    // [本地私改·补丁 Q] 清空前先补扫:残留 = 漏发文件(发过即删),先发出去再清
+    await this.outputHandler.sweepDir(chatId, this.outputsManager.dirFor(chatId));
     const outputsDir = this.outputsManager.prepareDir(chatId);
 
     // Send initial "thinking" card
@@ -2616,6 +2637,8 @@ export class MessageBridge {
     const cwd = session.workingDirectory;
     const abortController = new AbortController();
 
+    // [本地私改·补丁 Q] 清空前先补扫:残留 = 漏发文件(发过即删),先发出去再清
+    await this.outputHandler.sweepDir(chatId, this.outputsManager.dirFor(chatId));
     const outputsDir = this.outputsManager.prepareDir(chatId);
 
     const displayPrompt = prompt;
