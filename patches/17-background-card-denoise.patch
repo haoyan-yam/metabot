@@ -1,0 +1,591 @@
+diff --git a/src/engines/claude/stream-processor.ts b/src/engines/claude/stream-processor.ts
+index d6b0f54..6bb8d33 100644
+--- a/src/engines/claude/stream-processor.ts
++++ b/src/engines/claude/stream-processor.ts
+@@ -43,6 +43,14 @@ export class StreamProcessor {
+   private _lastOutputTokens: number | undefined;
+   // Live background tasks (Monitor, etc.) — task_id → latest rollup.
+   private _backgroundEvents: Map<string, BackgroundEvent> = new Map();
++  // [本地私改·patch R] 后台任务卡片降噪。Bash run_in_background 任务的 SDK
++  // task_started.description 就是命令原文，直接上卡就是一墙 shell + 蓝链 URL
++  //（2026-08 生产截图实锤）。这里在 tool_use 块出现时记下模型写的
++  // 人话 description 参数，task 事件到达后经 tool_use_id（或命令原文匹配）
++  // 关联回来，卡片展示人话而非命令。
++  private _bgBashByToolUse: Map<string, { human: string; command: string }> = new Map();
++  private _bgHumanDescByTask: Map<string, string> = new Map();
++  private _bgRawDescByTask: Map<string, string> = new Map();
+ 
+   constructor(private userPrompt: string) {}
+ 
+@@ -128,9 +136,28 @@ export class StreamProcessor {
+ 
+     const prior = this._backgroundEvents.get(taskId);
+     const patch = (m.patch as Record<string, unknown> | undefined) ?? undefined;
+-    const description = typeof m.description === 'string'
++    // [本地私改·patch R] rawDesc 保留 SDK 原文（shell 任务 = 命令原文），只用于
++    // 命令回显判重和人话关联，不再直接上卡。
++    const rawDesc = typeof m.description === 'string'
+       ? m.description
+-      : (typeof patch?.description === 'string' ? patch.description as string : prior?.description);
++      : (typeof patch?.description === 'string' ? patch.description as string : this._bgRawDescByTask.get(taskId));
++    if (rawDesc) this._bgRawDescByTask.set(taskId, rawDesc);
++
++    // [本地私改·patch R] 人话标签：优先 tool_use_id 精确关联；SDK 未带
++    // tool_use_id 时退回「任务描述 == Bash 命令原文」匹配。一旦定下就按
++    // task_id 记住，后续事件不再依赖 tool_use_id。
++    // 模型没写 description 时（生产实测很常见）退而求其次：从命令里取主程序名
++    // 当标签（`opencli` / `curl` / `lark-cli`），不泄命令原文又能区分多个任务。
++    const toolUseId = typeof m.tool_use_id === 'string' ? m.tool_use_id : undefined;
++    if (!this._bgHumanDescByTask.has(taskId)) {
++      const linked = toolUseId ? this._bgBashByToolUse.get(toolUseId) : undefined;
++      const matched = linked ?? (rawDesc ? this.findBashByCommand(rawDesc) : undefined);
++      const label = matched
++        ? (matched.human || commandLabel(matched.command))
++        : (rawDesc && looksLikeShellCommand(rawDesc) ? commandLabel(rawDesc) : undefined);
++      if (label) this._bgHumanDescByTask.set(taskId, label);
++    }
++    const humanDesc = this._bgHumanDescByTask.get(taskId);
+ 
+     let status: BackgroundTaskStatus = prior?.status ?? 'running';
+     if (subtype === 'task_notification') {
+@@ -146,17 +173,41 @@ export class StreamProcessor {
+     // SDKTaskNotificationMessage.summary carries the last-line event text for Monitor
+     // and the final message for one-shot background tasks. SDKTaskProgressMessage
+     // also exposes an optional summary for in-flight updates.
++    // [本地私改·patch R] shell 任务的 summary 常常只是命令回显——与 rawDesc
++    // 重复时丢弃；保留下来的展示文本一律去 URL（飞书会渲染成蓝链，极其扎眼）。
+     const summary = typeof m.summary === 'string' ? m.summary : undefined;
+-    const lastEvent = summary ?? prior?.lastEvent;
++    const isShellTask = rawDesc !== undefined && looksLikeShellCommand(rawDesc);
++    const cleanSummary = summary && !(isShellTask && isCommandEcho(summary, rawDesc))
++      ? stripUrls(summary)
++      : undefined;
++    const lastEvent = cleanSummary ?? prior?.lastEvent;
++
++    // [本地私改·patch R] 展示名：人话/程序名标签 > 非 shell 的原描述（去 URL）> 通用。
++    const displayDesc = humanDesc
++      ?? (rawDesc !== undefined
++        ? (isShellTask ? commandLabel(rawDesc) : stripUrls(rawDesc))
++        : prior?.description ?? '后台任务');
+ 
+     this._backgroundEvents.set(taskId, {
+       taskId,
+-      description: description ?? prior?.description ?? 'background task',
++      description: displayDesc,
+       status,
+       lastEvent,
+     });
+   }
+ 
++  /** [本地私改·patch R] 按命令原文反查 Bash 调用（SDK 事件缺 tool_use_id 时的兜底）。 */
++  private findBashByCommand(rawDesc: string): { human: string; command: string } | undefined {
++    const norm = normalizeWhitespace(rawDesc);
++    if (norm.length < 8) return undefined;
++    for (const entry of this._bgBashByToolUse.values()) {
++      const cmd = normalizeWhitespace(entry.command);
++      const n = Math.min(norm.length, cmd.length);
++      if (n >= 8 && norm.slice(0, n) === cmd.slice(0, n)) return entry;
++    }
++    return undefined;
++  }
++
+   private recordCodexTaskNotification(message: SDKMessage): void {
+     const m = message as Record<string, unknown>;
+     const result = typeof m.result === 'string' ? m.result : undefined;
+@@ -182,6 +233,21 @@ export class StreamProcessor {
+         }
+       } else if (block.type === 'tool_use' && block.name) {
+         this.addToolCall(block.name, block.input);
++        // [本地私改·patch R] Bash：记下模型写的人话 description，供 task 事件
++        // 关联（SDK 的任务描述是命令原文，不适合直接给用户看）。
++        // ⚠️ 不能只登记 run_in_background===true 的调用：0818 生产
++        // 会话实锤，落进 📡 Background 区块的 8 条命令 run_in_background 全是
++        // false（长命令被运行时转为任务跟踪），只认后台标志会一条都关联不上。
++        if (block.name === 'Bash' && block.id && block.input && typeof block.input === 'object') {
++          const binp = block.input as Record<string, unknown>;
++          if (typeof binp.command === 'string') {
++            const human = typeof binp.description === 'string' ? binp.description.trim() : '';
++            this._bgBashByToolUse.set(block.id, {
++              human,
++              command: binp.command,
++            });
++          }
++        }
+         // Detect interactive tools at top level
+         if (message.parent_tool_use_id === null || message.parent_tool_use_id === undefined) {
+           if (block.name === 'AskUserQuestion' && block.id && block.input) {
+@@ -472,6 +538,82 @@ function formatToolDetail(name: string, input: unknown): string {
+   }
+ }
+ 
++// ---------------------------------------------------------------------------
++// [本地私改·patch R] 后台任务展示文本清洗
++// ---------------------------------------------------------------------------
++
++function normalizeWhitespace(text: string): string {
++  return text.replace(/\s+/g, ' ').trim();
++}
++
++/**
++ * [本地私改·patch R] 判断一段任务描述是否像 shell 命令原文。
++ * 只用于「关联不到人话 description 时该不该把原文上卡」——误判为 shell 的
++ * 代价只是显示通用标签「后台命令」，两个结果都干净，无需完美。
++ */
++export function looksLikeShellCommand(text: string): boolean {
++  return (
++    /(\$\(|&&|\|\||\s\|\s|<<|>>|2>&1|`)/.test(text) ||
++    /^[A-Za-z_][A-Za-z0-9_]*=/.test(text) ||
++    /^\s*(for|while|if|cd|cat|curl|wget|env|bash|sh|node|python3?|npx|git|osascript|opencli)\s/.test(text)
++  );
++}
++
++/**
++ * [本地私改·patch R] 从命令里取主程序名当展示标签。
++ * 模型没写 description 时的兜底——0818 生产会话里 8 条进 Background 的
++ * 命令全都没有 description，若统一显示「后台命令」则彼此不可区分（失败的那条
++ * 看不出是什么活）。这里跳过 `cd` / 环境变量赋值 / `for`·`until` 等控制结构，
++ * 取第一个真正的可执行名（`opencli`、`curl`、`lark-cli`…）。程序名不是命令原文，
++ * 不含参数/URL/路径，可安全上卡。取不到时回落通用标签。
++ */
++export function commandLabel(command: string): string {
++  const GENERIC = '后台命令';
++  const SKIP_WORDS = new Set([
++    'cd', 'for', 'in', 'do', 'done', 'while', 'until', 'if', 'then', 'else', 'fi',
++    'sudo', 'env', 'time', 'nohup', 'exec', 'command', 'builtin',
++    'echo', 'true', 'false', 'set', 'source', 'eval',
++  ]);
++  // 先掐掉子命令替换与引号里的内容，避免把 $(...) / "..." 里的词当主程序
++  const flat = command
++    .replace(/\$\([^)]*\)/g, ' ')
++    .replace(/`[^`]*`/g, ' ')
++    .replace(/'[^']*'/g, ' ')
++    .replace(/"[^"]*"/g, ' ');
++  let skipNext = false;   // `for u in …` 的循环变量：跟在 for 后面的那个词不是程序名
++  for (const token of flat.split(/[\s;|&(){}]+/)) {
++    const t = token.trim();
++    if (!t) continue;
++    if (/^[-<>]/.test(t)) continue;                 // 选项 / 重定向
++    if (/[=$]/.test(t)) continue;                   // 变量赋值 / 变量引用
++    if (skipNext) { skipNext = false; continue; }
++    if (SKIP_WORDS.has(t)) {
++      if (t === 'for') skipNext = true;
++      continue;
++    }
++    if (!/^[A-Za-z][A-Za-z0-9._-]*$/.test(t)) continue;
++    const name = t.includes('/') ? t.slice(t.lastIndexOf('/') + 1) : t;
++    if (name.length > 24) continue;
++    return `${GENERIC} · ${name}`;
++  }
++  return GENERIC;
++}
++
++/** [本地私改·patch R] summary 是否只是命令原文的回显（前缀重合即视为回显）。 */
++function isCommandEcho(summary: string, rawDesc: string): boolean {
++  const a = normalizeWhitespace(summary);
++  const b = normalizeWhitespace(rawDesc);
++  if (!a || !b) return false;
++  const n = Math.min(a.length, b.length, 60);
++  if (n < 16) return a === b;
++  return a.slice(0, n) === b.slice(0, n);
++}
++
++/** [本地私改·patch R] URL 替换为占位符——飞书会把 URL 渲染成蓝链，在状态行里极其扎眼。 */
++export function stripUrls(text: string): string {
++  return text.replace(/https?:\/\/\S+/g, '[链接]');
++}
++
+ function shortenPath(filePath: string): string {
+   const parts = filePath.split('/');
+   if (parts.length <= 3) return filePath;
+diff --git a/src/feishu/card-builder-utils.ts b/src/feishu/card-builder-utils.ts
+index 1838824..4a3adb0 100644
+--- a/src/feishu/card-builder-utils.ts
++++ b/src/feishu/card-builder-utils.ts
+@@ -6,7 +6,7 @@
+  * truncation helpers.  This file is the single source of truth; import from
+  * here — do NOT copy these into individual builder files.
+  */
+-import type { CardStatus } from '../types.js';
++import type { BackgroundEvent, CardStatus } from '../types.js';
+ 
+ // ---------------------------------------------------------------------------
+ // Status display config
+@@ -35,6 +35,47 @@ export const BG_ICON: Record<'running' | 'completed' | 'failed' | 'stopped', str
+   stopped:   '⏹️',
+ };
+ 
++// ---------------------------------------------------------------------------
++// Background section rendering  [本地私改·patch R]
++// ---------------------------------------------------------------------------
++
++/** 逐条列出的（非 completed）后台任务行数上限，超出折叠成计数。 */
++const MAX_BG_LINES = 6;
++
++/**
++ * [本地私改·patch R] 后台任务区块统一渲染（v1/v2 builder 共用，勿各自复制）。
++ * 收敛规则——与工具行「用户只关心最终答案」同一哲学：
++ *   - 终卡（complete/error）整块隐藏，后台结果由最终回复正文交代；
++ *   - 只逐条列 failed/stopped/running（失败优先，保证可见），completed 折叠为计数；
++ *   - 逐条上限 MAX_BG_LINES，溢出折叠成「另有 N 个运行中」。
++ * 描述/lastEvent 的去代码化（人话关联、命令回显判重、去 URL）在数据层
++ * stream-processor 完成，这里只管排版。
++ */
++export function formatBackgroundSection(
++  events: BackgroundEvent[] | undefined,
++  status: CardStatus,
++): string | null {
++  if (!events || events.length === 0) return null;
++  if (status === 'complete' || status === 'error') return null;
++
++  const failed  = events.filter((ev) => ev.status === 'failed' || ev.status === 'stopped');
++  const running = events.filter((ev) => ev.status === 'running');
++  const done    = events.length - failed.length - running.length;
++
++  const listed = [...failed, ...running].slice(0, MAX_BG_LINES);
++  const lines = listed.map((ev) => {
++    const icon    = BG_ICON[ev.status];
++    const shortId = ev.taskId.slice(0, 6);
++    const desc    = truncate(ev.description, 60);
++    const last    = ev.lastEvent ? ` — _${truncate(ev.lastEvent, 100)}_` : '';
++    return `${icon} **${desc}** \`${shortId}\`${last}`;
++  });
++  const hidden = failed.length + running.length - listed.length;
++  if (hidden > 0) lines.push(`… 另有 ${hidden} 个运行中`);
++  if (done > 0) lines.push(`✅ ${done} 个已完成`);
++  return '📡 **Background**\n' + lines.join('\n');
++}
++
+ // ---------------------------------------------------------------------------
+ // Content truncation
+ // ---------------------------------------------------------------------------
+diff --git a/src/feishu/card-builder-v2.ts b/src/feishu/card-builder-v2.ts
+index 610a9fb..b9cb5a2 100644
+--- a/src/feishu/card-builder-v2.ts
++++ b/src/feishu/card-builder-v2.ts
+@@ -20,7 +20,7 @@ import type { CardState } from '../types.js';
+ import { parseMarkdownToBlocks, type Block } from './markdown-parser.js';
+ import {
+   STATUS_CONFIG,
+-  BG_ICON,
++  formatBackgroundSection,
+   truncate,
+   truncateContent,
+ } from './card-builder-utils.js';
+@@ -178,20 +178,15 @@ export function buildCardV2(state: CardState): string {
+     elements.push({ tag: 'hr' });
+   }
+ 
+-  // Background tasks (Monitor, etc.)
+-  if (state.backgroundEvents && state.backgroundEvents.length > 0) {
+-    const lines = state.backgroundEvents.map((ev) => {
+-      const icon    = BG_ICON[ev.status];
+-      const shortId = ev.taskId.slice(0, 6);
+-      const desc    = truncate(ev.description, 60);
+-      const last    = ev.lastEvent ? ` — _${truncate(ev.lastEvent, 140)}_` : '';
+-      return `${icon} **${desc}** \`${shortId}\`${last}`;
+-    });
+-    elements.push({
+-      tag:     'markdown',
+-      content: '📡 **Background**\n' + lines.join('\n'),
+-    });
+-    elements.push({ tag: 'hr' });
++  // Background tasks (Monitor, etc.) — [本地私改·patch R] 收敛渲染统一走
++  // card-builder-utils.formatBackgroundSection：failed/running 逐条（有上限）、
++  // completed 折叠计数、终卡整块隐藏。命令原文/URL 已在 stream-processor 清洗。
++  {
++    const bgSection = formatBackgroundSection(state.backgroundEvents, state.status);
++    if (bgSection) {
++      elements.push({ tag: 'markdown', content: bgSection });
++      elements.push({ tag: 'hr' });
++    }
+   }
+ 
+   // Response content (parsed into blocks)
+diff --git a/src/feishu/card-builder.ts b/src/feishu/card-builder.ts
+index 9d9584b..2b069eb 100644
+--- a/src/feishu/card-builder.ts
++++ b/src/feishu/card-builder.ts
+@@ -10,7 +10,7 @@ export type {
+ import type { CardState } from '../types.js';
+ import {
+   STATUS_CONFIG,
+-  BG_ICON,
++  formatBackgroundSection,
+   truncate,
+   truncateContent,
+ } from './card-builder-utils.js';
+@@ -90,20 +90,15 @@ export function buildCard(state: CardState): string {
+     elements.push({ tag: 'hr' });
+   }
+ 
+-  // Background tasks (Monitor, etc.) — show live stdout events / final status
+-  if (state.backgroundEvents && state.backgroundEvents.length > 0) {
+-    const lines = state.backgroundEvents.map((ev) => {
+-      const icon = BG_ICON[ev.status];
+-      const shortId = ev.taskId.slice(0, 6);
+-      const desc = truncate(ev.description, 60);
+-      const last = ev.lastEvent ? ` — _${truncate(ev.lastEvent, 140)}_` : '';
+-      return `${icon} **${desc}** \`${shortId}\`${last}`;
+-    });
+-    elements.push({
+-      tag: 'markdown',
+-      content: '📡 **Background**\n' + lines.join('\n'),
+-    });
+-    elements.push({ tag: 'hr' });
++  // Background tasks (Monitor, etc.) — [本地私改·patch R] 收敛渲染统一走
++  // card-builder-utils.formatBackgroundSection：failed/running 逐条（有上限）、
++  // completed 折叠计数、终卡整块隐藏。命令原文/URL 已在 stream-processor 清洗。
++  {
++    const bgSection = formatBackgroundSection(state.backgroundEvents, state.status);
++    if (bgSection) {
++      elements.push({ tag: 'markdown', content: bgSection });
++      elements.push({ tag: 'hr' });
++    }
+   }
+ 
+   // Response content
+diff --git a/tests/card-builder-v2.test.ts b/tests/card-builder-v2.test.ts
+index 1aa3624..795f94c 100644
+--- a/tests/card-builder-v2.test.ts
++++ b/tests/card-builder-v2.test.ts
+@@ -193,7 +193,8 @@ describe('buildCardV2', () => {
+     expect(toolEl).toBeUndefined();
+   });
+ 
+-  it('renders background events with status icon + last event', () => {
++  // [本地私改·patch R] 后台区块收敛：running 逐条、completed 折叠计数、终卡隐藏。
++  it('renders background events with running listed and completed collapsed', () => {
+     const state: CardState = {
+       status:       'running',
+       userPrompt:   'watch ci',
+@@ -211,6 +212,25 @@ describe('buildCardV2', () => {
+     expect(bg).toBeDefined();
+     expect(bg.content).toContain('Watching CI for PR #255');
+     expect(bg.content).toContain('check (20) running');
++    expect(bg.content).toContain('✅ 1 个已完成');
++    expect(bg.content).not.toContain('CI done: success');
++  });
++
++  it('hides background section once the turn is complete', () => {
++    const state: CardState = {
++      status:       'complete',
++      userPrompt:   'watch ci',
++      responseText: 'all done',
++      toolCalls:    [],
++      backgroundEvents: [
++        { taskId: 'bheol4172', description: 'Watching CI for PR #255', status: 'running', lastEvent: 'check (20) running' },
++      ],
++    };
++    const elements = findElements(JSON.parse(buildCardV2(state)));
++    const bg = elements.find(
++      (e) => e.tag === 'markdown' && typeof e.content === 'string' && /Background/.test(e.content),
++    );
++    expect(bg).toBeUndefined();
+   });
+ 
+   it('renders pendingQuestion as text-only (no buttons) with a typed-reply prompt', () => {
+diff --git a/tests/card-builder.test.ts b/tests/card-builder.test.ts
+index 9d2a3ad..b52c31d 100644
+--- a/tests/card-builder.test.ts
++++ b/tests/card-builder.test.ts
+@@ -165,7 +165,8 @@ describe('buildCard', () => {
+     expect(md).toBeDefined();
+   });
+ 
+-  it('renders a background task section with status icon + last event', () => {
++  // [本地私改·patch R] 后台区块收敛：running/failed 逐条、completed 折叠计数。
++  it('renders a background task section with running listed and completed collapsed', () => {
+     const state: CardState = {
+       status: 'running',
+       userPrompt: 'watch ci',
+@@ -180,11 +181,53 @@ describe('buildCard', () => {
+     const bg = json.elements.find((e: any) => e.tag === 'markdown' && /Background/.test(e.content));
+     expect(bg).toBeDefined();
+     expect(bg.content).toContain('⏳');
+-    expect(bg.content).toContain('✅');
+     expect(bg.content).toContain('Watching CI for PR #215');
+     expect(bg.content).toContain('check (20) running');
+-    expect(bg.content).toContain('CI done: success');
+     expect(bg.content).toContain('bheol4'); // short task id
++    // completed 折叠成计数，不再逐条展示描述/lastEvent
++    expect(bg.content).toContain('✅ 1 个已完成');
++    expect(bg.content).not.toContain('Watching deploy');
++    expect(bg.content).not.toContain('CI done: success');
++  });
++
++  it('lists failed tasks ahead of running ones and caps listed lines', () => {
++    const running = Array.from({ length: 8 }, (_, i) => ({
++      taskId: `brun${i}xx`,
++      description: `task ${i}`,
++      status: 'running' as const,
++    }));
++    const state: CardState = {
++      status: 'running',
++      userPrompt: 'x',
++      responseText: '',
++      toolCalls: [],
++      backgroundEvents: [
++        ...running,
++        { taskId: 'bfail01', description: 'broken task', status: 'failed', lastEvent: 'crashed' },
++      ],
++    };
++    const json = JSON.parse(buildCard(state));
++    const bg = json.elements.find((e: any) => e.tag === 'markdown' && /Background/.test(e.content));
++    // failed 永远可见且排最前
++    const lines: string[] = bg.content.split('\n');
++    expect(lines[1]).toContain('broken task');
++    expect(lines[1]).toContain('❌');
++    // 6 条上限 + 溢出折叠
++    expect(bg.content).toContain('… 另有 3 个运行中');
++  });
++
++  // [本地私改·patch R] 终卡隐藏后台区块——与工具行同一哲学，最终回复正文交代结果。
++  it('hides background section on complete/error cards', () => {
++    const events = [
++      { taskId: 'bheol4172', description: 'Watching CI', status: 'running' as const },
++    ];
++    for (const status of ['complete', 'error'] as const) {
++      const json = JSON.parse(buildCard({
++        status, userPrompt: 'x', responseText: 'done', toolCalls: [], backgroundEvents: events,
++      }));
++      const bg = json.elements.find((e: any) => e.tag === 'markdown' && /Background/.test(e.content));
++      expect(bg).toBeUndefined();
++    }
+   });
+ 
+   it('omits background section when no events', () => {
+diff --git a/tests/stream-processor.test.ts b/tests/stream-processor.test.ts
+index 57cd9fc..48fce58 100644
+--- a/tests/stream-processor.test.ts
++++ b/tests/stream-processor.test.ts
+@@ -317,6 +317,130 @@ describe('StreamProcessor background task events', () => {
+   });
+ });
+ 
++// [本地私改·patch R] 后台任务卡片降噪：命令原文不上卡。
++describe('StreamProcessor background task de-noising (patch R)', () => {
++  const COMMAND = 'for u in "http://xhslink.cn/o/AAAA1111" "http://xhslink.cn/o/BBBB2222"; do opencli browser xhs open "$u"; done';
++
++  function bashToolUse(
++    p: StreamProcessor,
++    id: string,
++    human: string | undefined,
++    command = COMMAND,
++    background = true,
++  ): void {
++    p.processMessage(msg({
++      type: 'assistant',
++      parent_tool_use_id: null,
++      message: {
++        content: [{
++          type: 'tool_use', id, name: 'Bash',
++          input: {
++            command,
++            ...(human ? { description: human } : {}),
++            run_in_background: background,
++          },
++        }],
++      },
++    } as unknown as SDKMessage));
++  }
++
++  it('shows the Bash description param instead of the raw command (tool_use_id link)', () => {
++    const p = new StreamProcessor('hi');
++    bashToolUse(p, 'tu-1', '后台打开小红书链接');
++    const state = p.processMessage(msg({
++      type: 'system', subtype: 'task_started', task_id: 'b1',
++      tool_use_id: 'tu-1', description: COMMAND,
++    } as unknown as SDKMessage));
++    const ev = state.backgroundEvents?.find((e) => e.taskId === 'b1');
++    expect(ev?.description).toBe('后台打开小红书链接');
++    expect(ev?.description).not.toContain('xhslink');
++  });
++
++  it('falls back to matching the command text when the task event lacks tool_use_id', () => {
++    const p = new StreamProcessor('hi');
++    bashToolUse(p, 'tu-1', '后台打开小红书链接');
++    const state = p.processMessage(msg({
++      type: 'system', subtype: 'task_started', task_id: 'b1', description: COMMAND,
++    } as unknown as SDKMessage));
++    expect(state.backgroundEvents?.[0].description).toBe('后台打开小红书链接');
++  });
++
++  it('labels shell tasks by their main binary when no tool call is linked', () => {
++    const p = new StreamProcessor('hi');
++    const state = p.processMessage(msg({
++      type: 'system', subtype: 'task_started', task_id: 'b1',
++      description: 'U=$(sed -n 1p x.txt) && opencli xiaohongshu note "$U" 2>&1 | tee out.json',
++    } as unknown as SDKMessage));
++    // 主程序名可区分多个任务，且不含参数/URL/路径
++    expect(state.backgroundEvents?.[0].description).toBe('后台命令 · opencli');
++  });
++
++  // 0818 生产实锤：进 Background 区块的命令 run_in_background=false
++  // 且没有 description —— 只认后台标志会一条都关联不上。
++  it('links foreground Bash calls too (run_in_background=false)', () => {
++    const p = new StreamProcessor('hi');
++    bashToolUse(p, 'tu-1', '打开小红书笔记页', COMMAND, false);
++    const state = p.processMessage(msg({
++      type: 'system', subtype: 'task_started', task_id: 'b1',
++      tool_use_id: 'tu-1', description: COMMAND,
++    } as unknown as SDKMessage));
++    expect(state.backgroundEvents?.[0].description).toBe('打开小红书笔记页');
++  });
++
++  it('falls back to the binary label when the linked Bash call has no description', () => {
++    const p = new StreamProcessor('hi');
++    bashToolUse(p, 'tu-1', undefined, 'cd /Users/me/projects/demo/work && for u in "http://xhslink.cn/o/x"; do opencli browser xhs open "$u"; done', false);
++    const state = p.processMessage(msg({
++      type: 'system', subtype: 'task_started', task_id: 'b1',
++      tool_use_id: 'tu-1',
++      description: 'cd /Users/me/projects/demo/work && for u in "http://xhslink.cn/o/x"; do opencli browser xhs open "$u"; done',
++    } as unknown as SDKMessage));
++    const desc = state.backgroundEvents?.[0].description ?? '';
++    expect(desc).toBe('后台命令 · opencli');   // 跳过 cd/for，取真正的可执行名
++    expect(desc).not.toContain('xhslink');     // 不泄 URL
++    expect(desc).not.toContain('/Users/');     // 不泄本机路径
++  });
++
++  it('keeps human descriptions (Monitor etc.) verbatim', () => {
++    const p = new StreamProcessor('hi');
++    const state = p.processMessage(msg({
++      type: 'system', subtype: 'task_started', task_id: 'm1',
++      description: 'Watching CI for PR #215',
++    } as unknown as SDKMessage));
++    expect(state.backgroundEvents?.[0].description).toBe('Watching CI for PR #215');
++  });
++
++  it('drops a summary that merely echoes the shell command', () => {
++    const p = new StreamProcessor('hi');
++    bashToolUse(p, 'tu-1', '后台打开小红书链接');
++    p.processMessage(msg({
++      type: 'system', subtype: 'task_started', task_id: 'b1',
++      tool_use_id: 'tu-1', description: COMMAND,
++    } as unknown as SDKMessage));
++    const state = p.processMessage(msg({
++      type: 'system', subtype: 'task_notification', task_id: 'b1',
++      status: 'completed', summary: COMMAND.slice(0, 80),
++    } as unknown as SDKMessage));
++    const ev = state.backgroundEvents?.find((e) => e.taskId === 'b1');
++    expect(ev?.status).toBe('completed');
++    expect(ev?.lastEvent).toBeUndefined();
++  });
++
++  it('keeps a real summary for shell tasks but strips URLs', () => {
++    const p = new StreamProcessor('hi');
++    bashToolUse(p, 'tu-1', '后台打开小红书链接');
++    p.processMessage(msg({
++      type: 'system', subtype: 'task_started', task_id: 'b1',
++      tool_use_id: 'tu-1', description: COMMAND,
++    } as unknown as SDKMessage));
++    const state = p.processMessage(msg({
++      type: 'system', subtype: 'task_notification', task_id: 'b1',
++      status: 'completed', summary: 'saved 6 notes from http://xhslink.cn/o/abc to notes/',
++    } as unknown as SDKMessage));
++    expect(state.backgroundEvents?.[0].lastEvent).toBe('saved 6 notes from [链接] to notes/');
++  });
++});
++
+ describe('extractImagePaths', () => {
+   it('extracts image paths from text', () => {
+     const text = 'Created file at /tmp/img/chart.png and /home/user/photo.jpg';

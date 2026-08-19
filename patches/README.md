@@ -1,6 +1,6 @@
 # MetaBot 本地补丁集 · Local Patch Set
 
-基于上游 [xvirobotics/metabot](https://github.com/xvirobotics/metabot) `main`（f5454e9，2026-07）的 **14 个功能补丁**，主要增强飞书（Feishu/Lark）桥接的群聊体验与消息投递可靠性。
+基于上游 [xvirobotics/metabot](https://github.com/xvirobotics/metabot) `main`（f5454e9，2026-07）的 **15 个功能补丁**，主要增强飞书（Feishu/Lark）桥接的群聊体验与消息投递可靠性。
 
 **`local-patches` 分支已把全部补丁应用进源码**，clone 后切到该分支即可直接使用；本目录附带补丁原件（`git diff` 格式），便于你在自己的 metabot 检出上选择性重打。
 
@@ -22,8 +22,9 @@
 | 14 | large-file-chunk-download | N | 超 100MB 附件（单次 GET 报 234037）自动转 HTTP Range 分片下载；下载失败不再静默——prompt 里写明文件名与原因；群聊媒体缓存 TTL 5→30 分钟、过期丢弃打 WARN |
 | 15 | quote-context-injection | P | 群聊「引用回复 + @bot」时把被引内容注入回合上下文：自家消息走出站台账（卡片存终版文本、媒体存 key 可回捞重下），他人消息走 `message.get` 拉取，被引图片/文件落地为本地文件喂给 agent；任何失败降级提示、绝不影响本回合 |
 | 16 | send-and-sweep-outputs | Q | 发送目录生命周期补全：发送成功**立即删除**（「目录里还有 = 一定没发过」，所有入口天然免疫重复发送）；spontaneous 卡片后 / 开轮清空前 / 延迟 rmSync 前三处**补扫发送**残留——后台任务（慢速生图）回合结束后落盘的产物不再被静默销毁，落盘即发；per-chat 发送互斥防并发双发。关闭补丁 08 的已知取舍缺口 |
+| 17 | background-card-denoise | R | Running 卡片「📡 Background」区块去代码化：后台 Bash 任务的 SDK 描述就是命令原文，逐条上卡即一墙 shell + 蓝链 URL。改为经 tool_use_id（缺失时按命令原文匹配）关联回模型写的人话 `description` 上卡，关联不到时显示「后台命令」；summary 命令回显判重丢弃、展示文本去 URL；failed/stopped 永远逐条且置顶、running 合计上限 6 条溢出折叠、completed 折叠为计数；终卡（Complete/Error）整块隐藏 |
 
-代号 A–Q 与源码注释里的 `[本地私改·patch X]` 标记一一对应，方便在代码里定位每个补丁的改动和设计取舍说明（I/J 已移除、O 预留给搁置的 outputs 投递重构，均不复用）。
+代号 A–R 与源码注释里的 `[本地私改·patch X]` 标记一一对应，方便在代码里定位每个补丁的改动和设计取舍说明（I/J 已移除、O 预留给搁置的 outputs 投递重构，均不复用）。
 
 > **已移除**：原补丁 09（thread-topic-reply，代号 I）与 10（at-requester-on-completion，代号 J）于 2026-07-26 移除——飞书话题（thread）功能在部署中已停用，二者生产一个月零触发，且是未来升级基底时最大的冲突面。编号保留空洞不重排；旧补丁可在 git 历史（提交 fd66d7a 及之前）找回。移除时补丁 04/11/12/14 已在无话题基线上重新生成。
 
