@@ -165,7 +165,8 @@ describe('buildCard', () => {
     expect(md).toBeDefined();
   });
 
-  it('renders a background task section with status icon + last event', () => {
+  // [本地私改·patch R] 后台区块收敛：running/failed 逐条、completed 折叠计数。
+  it('renders a background task section with running listed and completed collapsed', () => {
     const state: CardState = {
       status: 'running',
       userPrompt: 'watch ci',
@@ -180,11 +181,53 @@ describe('buildCard', () => {
     const bg = json.elements.find((e: any) => e.tag === 'markdown' && /Background/.test(e.content));
     expect(bg).toBeDefined();
     expect(bg.content).toContain('⏳');
-    expect(bg.content).toContain('✅');
     expect(bg.content).toContain('Watching CI for PR #215');
     expect(bg.content).toContain('check (20) running');
-    expect(bg.content).toContain('CI done: success');
     expect(bg.content).toContain('bheol4'); // short task id
+    // completed 折叠成计数，不再逐条展示描述/lastEvent
+    expect(bg.content).toContain('✅ 1 个已完成');
+    expect(bg.content).not.toContain('Watching deploy');
+    expect(bg.content).not.toContain('CI done: success');
+  });
+
+  it('lists failed tasks ahead of running ones and caps listed lines', () => {
+    const running = Array.from({ length: 8 }, (_, i) => ({
+      taskId: `brun${i}xx`,
+      description: `task ${i}`,
+      status: 'running' as const,
+    }));
+    const state: CardState = {
+      status: 'running',
+      userPrompt: 'x',
+      responseText: '',
+      toolCalls: [],
+      backgroundEvents: [
+        ...running,
+        { taskId: 'bfail01', description: 'broken task', status: 'failed', lastEvent: 'crashed' },
+      ],
+    };
+    const json = JSON.parse(buildCard(state));
+    const bg = json.elements.find((e: any) => e.tag === 'markdown' && /Background/.test(e.content));
+    // failed 永远可见且排最前
+    const lines: string[] = bg.content.split('\n');
+    expect(lines[1]).toContain('broken task');
+    expect(lines[1]).toContain('❌');
+    // 6 条上限 + 溢出折叠
+    expect(bg.content).toContain('… 另有 3 个运行中');
+  });
+
+  // [本地私改·patch R] 终卡隐藏后台区块——与工具行同一哲学，最终回复正文交代结果。
+  it('hides background section on complete/error cards', () => {
+    const events = [
+      { taskId: 'bheol4172', description: 'Watching CI', status: 'running' as const },
+    ];
+    for (const status of ['complete', 'error'] as const) {
+      const json = JSON.parse(buildCard({
+        status, userPrompt: 'x', responseText: 'done', toolCalls: [], backgroundEvents: events,
+      }));
+      const bg = json.elements.find((e: any) => e.tag === 'markdown' && /Background/.test(e.content));
+      expect(bg).toBeUndefined();
+    }
   });
 
   it('omits background section when no events', () => {

@@ -43,6 +43,14 @@ export class StreamProcessor {
   private _lastOutputTokens: number | undefined;
   // Live background tasks (Monitor, etc.) — task_id → latest rollup.
   private _backgroundEvents: Map<string, BackgroundEvent> = new Map();
+  // [本地私改·patch R] 后台任务卡片降噪。Bash run_in_background 任务的 SDK
+  // task_started.description 就是命令原文，直接上卡就是一墙 shell + 蓝链 URL
+  //（2026-08 生产截图实锤）。这里在 tool_use 块出现时记下模型写的
+  // 人话 description 参数，task 事件到达后经 tool_use_id（或命令原文匹配）
+  // 关联回来，卡片展示人话而非命令。
+  private _bgBashByToolUse: Map<string, { human: string; command: string }> = new Map();
+  private _bgHumanDescByTask: Map<string, string> = new Map();
+  private _bgRawDescByTask: Map<string, string> = new Map();
 
   constructor(private userPrompt: string) {}
 
@@ -128,9 +136,28 @@ export class StreamProcessor {
 
     const prior = this._backgroundEvents.get(taskId);
     const patch = (m.patch as Record<string, unknown> | undefined) ?? undefined;
-    const description = typeof m.description === 'string'
+    // [本地私改·patch R] rawDesc 保留 SDK 原文（shell 任务 = 命令原文），只用于
+    // 命令回显判重和人话关联，不再直接上卡。
+    const rawDesc = typeof m.description === 'string'
       ? m.description
-      : (typeof patch?.description === 'string' ? patch.description as string : prior?.description);
+      : (typeof patch?.description === 'string' ? patch.description as string : this._bgRawDescByTask.get(taskId));
+    if (rawDesc) this._bgRawDescByTask.set(taskId, rawDesc);
+
+    // [本地私改·patch R] 人话标签：优先 tool_use_id 精确关联；SDK 未带
+    // tool_use_id 时退回「任务描述 == Bash 命令原文」匹配。一旦定下就按
+    // task_id 记住，后续事件不再依赖 tool_use_id。
+    // 模型没写 description 时（生产实测很常见）退而求其次：从命令里取主程序名
+    // 当标签（`opencli` / `curl` / `lark-cli`），不泄命令原文又能区分多个任务。
+    const toolUseId = typeof m.tool_use_id === 'string' ? m.tool_use_id : undefined;
+    if (!this._bgHumanDescByTask.has(taskId)) {
+      const linked = toolUseId ? this._bgBashByToolUse.get(toolUseId) : undefined;
+      const matched = linked ?? (rawDesc ? this.findBashByCommand(rawDesc) : undefined);
+      const label = matched
+        ? (matched.human || commandLabel(matched.command))
+        : (rawDesc && looksLikeShellCommand(rawDesc) ? commandLabel(rawDesc) : undefined);
+      if (label) this._bgHumanDescByTask.set(taskId, label);
+    }
+    const humanDesc = this._bgHumanDescByTask.get(taskId);
 
     let status: BackgroundTaskStatus = prior?.status ?? 'running';
     if (subtype === 'task_notification') {
@@ -146,15 +173,39 @@ export class StreamProcessor {
     // SDKTaskNotificationMessage.summary carries the last-line event text for Monitor
     // and the final message for one-shot background tasks. SDKTaskProgressMessage
     // also exposes an optional summary for in-flight updates.
+    // [本地私改·patch R] shell 任务的 summary 常常只是命令回显——与 rawDesc
+    // 重复时丢弃；保留下来的展示文本一律去 URL（飞书会渲染成蓝链，极其扎眼）。
     const summary = typeof m.summary === 'string' ? m.summary : undefined;
-    const lastEvent = summary ?? prior?.lastEvent;
+    const isShellTask = rawDesc !== undefined && looksLikeShellCommand(rawDesc);
+    const cleanSummary = summary && !(isShellTask && isCommandEcho(summary, rawDesc))
+      ? stripUrls(summary)
+      : undefined;
+    const lastEvent = cleanSummary ?? prior?.lastEvent;
+
+    // [本地私改·patch R] 展示名：人话/程序名标签 > 非 shell 的原描述（去 URL）> 通用。
+    const displayDesc = humanDesc
+      ?? (rawDesc !== undefined
+        ? (isShellTask ? commandLabel(rawDesc) : stripUrls(rawDesc))
+        : prior?.description ?? '后台任务');
 
     this._backgroundEvents.set(taskId, {
       taskId,
-      description: description ?? prior?.description ?? 'background task',
+      description: displayDesc,
       status,
       lastEvent,
     });
+  }
+
+  /** [本地私改·patch R] 按命令原文反查 Bash 调用（SDK 事件缺 tool_use_id 时的兜底）。 */
+  private findBashByCommand(rawDesc: string): { human: string; command: string } | undefined {
+    const norm = normalizeWhitespace(rawDesc);
+    if (norm.length < 8) return undefined;
+    for (const entry of this._bgBashByToolUse.values()) {
+      const cmd = normalizeWhitespace(entry.command);
+      const n = Math.min(norm.length, cmd.length);
+      if (n >= 8 && norm.slice(0, n) === cmd.slice(0, n)) return entry;
+    }
+    return undefined;
   }
 
   private recordCodexTaskNotification(message: SDKMessage): void {
@@ -182,6 +233,21 @@ export class StreamProcessor {
         }
       } else if (block.type === 'tool_use' && block.name) {
         this.addToolCall(block.name, block.input);
+        // [本地私改·patch R] Bash：记下模型写的人话 description，供 task 事件
+        // 关联（SDK 的任务描述是命令原文，不适合直接给用户看）。
+        // ⚠️ 不能只登记 run_in_background===true 的调用：0818 生产
+        // 会话实锤，落进 📡 Background 区块的 8 条命令 run_in_background 全是
+        // false（长命令被运行时转为任务跟踪），只认后台标志会一条都关联不上。
+        if (block.name === 'Bash' && block.id && block.input && typeof block.input === 'object') {
+          const binp = block.input as Record<string, unknown>;
+          if (typeof binp.command === 'string') {
+            const human = typeof binp.description === 'string' ? binp.description.trim() : '';
+            this._bgBashByToolUse.set(block.id, {
+              human,
+              command: binp.command,
+            });
+          }
+        }
         // Detect interactive tools at top level
         if (message.parent_tool_use_id === null || message.parent_tool_use_id === undefined) {
           if (block.name === 'AskUserQuestion' && block.id && block.input) {
@@ -470,6 +536,82 @@ function formatToolDetail(name: string, input: unknown): string {
     default:
       return '';
   }
+}
+
+// ---------------------------------------------------------------------------
+// [本地私改·patch R] 后台任务展示文本清洗
+// ---------------------------------------------------------------------------
+
+function normalizeWhitespace(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * [本地私改·patch R] 判断一段任务描述是否像 shell 命令原文。
+ * 只用于「关联不到人话 description 时该不该把原文上卡」——误判为 shell 的
+ * 代价只是显示通用标签「后台命令」，两个结果都干净，无需完美。
+ */
+export function looksLikeShellCommand(text: string): boolean {
+  return (
+    /(\$\(|&&|\|\||\s\|\s|<<|>>|2>&1|`)/.test(text) ||
+    /^[A-Za-z_][A-Za-z0-9_]*=/.test(text) ||
+    /^\s*(for|while|if|cd|cat|curl|wget|env|bash|sh|node|python3?|npx|git|osascript|opencli)\s/.test(text)
+  );
+}
+
+/**
+ * [本地私改·patch R] 从命令里取主程序名当展示标签。
+ * 模型没写 description 时的兜底——0818 生产会话里 8 条进 Background 的
+ * 命令全都没有 description，若统一显示「后台命令」则彼此不可区分（失败的那条
+ * 看不出是什么活）。这里跳过 `cd` / 环境变量赋值 / `for`·`until` 等控制结构，
+ * 取第一个真正的可执行名（`opencli`、`curl`、`lark-cli`…）。程序名不是命令原文，
+ * 不含参数/URL/路径，可安全上卡。取不到时回落通用标签。
+ */
+export function commandLabel(command: string): string {
+  const GENERIC = '后台命令';
+  const SKIP_WORDS = new Set([
+    'cd', 'for', 'in', 'do', 'done', 'while', 'until', 'if', 'then', 'else', 'fi',
+    'sudo', 'env', 'time', 'nohup', 'exec', 'command', 'builtin',
+    'echo', 'true', 'false', 'set', 'source', 'eval',
+  ]);
+  // 先掐掉子命令替换与引号里的内容，避免把 $(...) / "..." 里的词当主程序
+  const flat = command
+    .replace(/\$\([^)]*\)/g, ' ')
+    .replace(/`[^`]*`/g, ' ')
+    .replace(/'[^']*'/g, ' ')
+    .replace(/"[^"]*"/g, ' ');
+  let skipNext = false;   // `for u in …` 的循环变量：跟在 for 后面的那个词不是程序名
+  for (const token of flat.split(/[\s;|&(){}]+/)) {
+    const t = token.trim();
+    if (!t) continue;
+    if (/^[-<>]/.test(t)) continue;                 // 选项 / 重定向
+    if (/[=$]/.test(t)) continue;                   // 变量赋值 / 变量引用
+    if (skipNext) { skipNext = false; continue; }
+    if (SKIP_WORDS.has(t)) {
+      if (t === 'for') skipNext = true;
+      continue;
+    }
+    if (!/^[A-Za-z][A-Za-z0-9._-]*$/.test(t)) continue;
+    const name = t.includes('/') ? t.slice(t.lastIndexOf('/') + 1) : t;
+    if (name.length > 24) continue;
+    return `${GENERIC} · ${name}`;
+  }
+  return GENERIC;
+}
+
+/** [本地私改·patch R] summary 是否只是命令原文的回显（前缀重合即视为回显）。 */
+function isCommandEcho(summary: string, rawDesc: string): boolean {
+  const a = normalizeWhitespace(summary);
+  const b = normalizeWhitespace(rawDesc);
+  if (!a || !b) return false;
+  const n = Math.min(a.length, b.length, 60);
+  if (n < 16) return a === b;
+  return a.slice(0, n) === b.slice(0, n);
+}
+
+/** [本地私改·patch R] URL 替换为占位符——飞书会把 URL 渲染成蓝链，在状态行里极其扎眼。 */
+export function stripUrls(text: string): string {
+  return text.replace(/https?:\/\/\S+/g, '[链接]');
 }
 
 function shortenPath(filePath: string): string {

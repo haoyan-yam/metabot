@@ -193,7 +193,8 @@ describe('buildCardV2', () => {
     expect(toolEl).toBeUndefined();
   });
 
-  it('renders background events with status icon + last event', () => {
+  // [本地私改·patch R] 后台区块收敛：running 逐条、completed 折叠计数、终卡隐藏。
+  it('renders background events with running listed and completed collapsed', () => {
     const state: CardState = {
       status:       'running',
       userPrompt:   'watch ci',
@@ -211,6 +212,25 @@ describe('buildCardV2', () => {
     expect(bg).toBeDefined();
     expect(bg.content).toContain('Watching CI for PR #255');
     expect(bg.content).toContain('check (20) running');
+    expect(bg.content).toContain('✅ 1 个已完成');
+    expect(bg.content).not.toContain('CI done: success');
+  });
+
+  it('hides background section once the turn is complete', () => {
+    const state: CardState = {
+      status:       'complete',
+      userPrompt:   'watch ci',
+      responseText: 'all done',
+      toolCalls:    [],
+      backgroundEvents: [
+        { taskId: 'bheol4172', description: 'Watching CI for PR #255', status: 'running', lastEvent: 'check (20) running' },
+      ],
+    };
+    const elements = findElements(JSON.parse(buildCardV2(state)));
+    const bg = elements.find(
+      (e) => e.tag === 'markdown' && typeof e.content === 'string' && /Background/.test(e.content),
+    );
+    expect(bg).toBeUndefined();
   });
 
   it('renders pendingQuestion as text-only (no buttons) with a typed-reply prompt', () => {

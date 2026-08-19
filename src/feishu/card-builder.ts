@@ -10,7 +10,7 @@ export type {
 import type { CardState } from '../types.js';
 import {
   STATUS_CONFIG,
-  BG_ICON,
+  formatBackgroundSection,
   truncate,
   truncateContent,
 } from './card-builder-utils.js';
@@ -90,20 +90,15 @@ export function buildCard(state: CardState): string {
     elements.push({ tag: 'hr' });
   }
 
-  // Background tasks (Monitor, etc.) — show live stdout events / final status
-  if (state.backgroundEvents && state.backgroundEvents.length > 0) {
-    const lines = state.backgroundEvents.map((ev) => {
-      const icon = BG_ICON[ev.status];
-      const shortId = ev.taskId.slice(0, 6);
-      const desc = truncate(ev.description, 60);
-      const last = ev.lastEvent ? ` — _${truncate(ev.lastEvent, 140)}_` : '';
-      return `${icon} **${desc}** \`${shortId}\`${last}`;
-    });
-    elements.push({
-      tag: 'markdown',
-      content: '📡 **Background**\n' + lines.join('\n'),
-    });
-    elements.push({ tag: 'hr' });
+  // Background tasks (Monitor, etc.) — [本地私改·patch R] 收敛渲染统一走
+  // card-builder-utils.formatBackgroundSection：failed/running 逐条（有上限）、
+  // completed 折叠计数、终卡整块隐藏。命令原文/URL 已在 stream-processor 清洗。
+  {
+    const bgSection = formatBackgroundSection(state.backgroundEvents, state.status);
+    if (bgSection) {
+      elements.push({ tag: 'markdown', content: bgSection });
+      elements.push({ tag: 'hr' });
+    }
   }
 
   // Response content

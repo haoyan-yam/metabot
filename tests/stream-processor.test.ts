@@ -317,6 +317,130 @@ describe('StreamProcessor background task events', () => {
   });
 });
 
+// [本地私改·patch R] 后台任务卡片降噪：命令原文不上卡。
+describe('StreamProcessor background task de-noising (patch R)', () => {
+  const COMMAND = 'for u in "http://xhslink.cn/o/AAAA1111" "http://xhslink.cn/o/BBBB2222"; do opencli browser xhs open "$u"; done';
+
+  function bashToolUse(
+    p: StreamProcessor,
+    id: string,
+    human: string | undefined,
+    command = COMMAND,
+    background = true,
+  ): void {
+    p.processMessage(msg({
+      type: 'assistant',
+      parent_tool_use_id: null,
+      message: {
+        content: [{
+          type: 'tool_use', id, name: 'Bash',
+          input: {
+            command,
+            ...(human ? { description: human } : {}),
+            run_in_background: background,
+          },
+        }],
+      },
+    } as unknown as SDKMessage));
+  }
+
+  it('shows the Bash description param instead of the raw command (tool_use_id link)', () => {
+    const p = new StreamProcessor('hi');
+    bashToolUse(p, 'tu-1', '后台打开小红书链接');
+    const state = p.processMessage(msg({
+      type: 'system', subtype: 'task_started', task_id: 'b1',
+      tool_use_id: 'tu-1', description: COMMAND,
+    } as unknown as SDKMessage));
+    const ev = state.backgroundEvents?.find((e) => e.taskId === 'b1');
+    expect(ev?.description).toBe('后台打开小红书链接');
+    expect(ev?.description).not.toContain('xhslink');
+  });
+
+  it('falls back to matching the command text when the task event lacks tool_use_id', () => {
+    const p = new StreamProcessor('hi');
+    bashToolUse(p, 'tu-1', '后台打开小红书链接');
+    const state = p.processMessage(msg({
+      type: 'system', subtype: 'task_started', task_id: 'b1', description: COMMAND,
+    } as unknown as SDKMessage));
+    expect(state.backgroundEvents?.[0].description).toBe('后台打开小红书链接');
+  });
+
+  it('labels shell tasks by their main binary when no tool call is linked', () => {
+    const p = new StreamProcessor('hi');
+    const state = p.processMessage(msg({
+      type: 'system', subtype: 'task_started', task_id: 'b1',
+      description: 'U=$(sed -n 1p x.txt) && opencli xiaohongshu note "$U" 2>&1 | tee out.json',
+    } as unknown as SDKMessage));
+    // 主程序名可区分多个任务，且不含参数/URL/路径
+    expect(state.backgroundEvents?.[0].description).toBe('后台命令 · opencli');
+  });
+
+  // 0818 生产实锤：进 Background 区块的命令 run_in_background=false
+  // 且没有 description —— 只认后台标志会一条都关联不上。
+  it('links foreground Bash calls too (run_in_background=false)', () => {
+    const p = new StreamProcessor('hi');
+    bashToolUse(p, 'tu-1', '打开小红书笔记页', COMMAND, false);
+    const state = p.processMessage(msg({
+      type: 'system', subtype: 'task_started', task_id: 'b1',
+      tool_use_id: 'tu-1', description: COMMAND,
+    } as unknown as SDKMessage));
+    expect(state.backgroundEvents?.[0].description).toBe('打开小红书笔记页');
+  });
+
+  it('falls back to the binary label when the linked Bash call has no description', () => {
+    const p = new StreamProcessor('hi');
+    bashToolUse(p, 'tu-1', undefined, 'cd /Users/me/projects/demo/work && for u in "http://xhslink.cn/o/x"; do opencli browser xhs open "$u"; done', false);
+    const state = p.processMessage(msg({
+      type: 'system', subtype: 'task_started', task_id: 'b1',
+      tool_use_id: 'tu-1',
+      description: 'cd /Users/me/projects/demo/work && for u in "http://xhslink.cn/o/x"; do opencli browser xhs open "$u"; done',
+    } as unknown as SDKMessage));
+    const desc = state.backgroundEvents?.[0].description ?? '';
+    expect(desc).toBe('后台命令 · opencli');   // 跳过 cd/for，取真正的可执行名
+    expect(desc).not.toContain('xhslink');     // 不泄 URL
+    expect(desc).not.toContain('/Users/');     // 不泄本机路径
+  });
+
+  it('keeps human descriptions (Monitor etc.) verbatim', () => {
+    const p = new StreamProcessor('hi');
+    const state = p.processMessage(msg({
+      type: 'system', subtype: 'task_started', task_id: 'm1',
+      description: 'Watching CI for PR #215',
+    } as unknown as SDKMessage));
+    expect(state.backgroundEvents?.[0].description).toBe('Watching CI for PR #215');
+  });
+
+  it('drops a summary that merely echoes the shell command', () => {
+    const p = new StreamProcessor('hi');
+    bashToolUse(p, 'tu-1', '后台打开小红书链接');
+    p.processMessage(msg({
+      type: 'system', subtype: 'task_started', task_id: 'b1',
+      tool_use_id: 'tu-1', description: COMMAND,
+    } as unknown as SDKMessage));
+    const state = p.processMessage(msg({
+      type: 'system', subtype: 'task_notification', task_id: 'b1',
+      status: 'completed', summary: COMMAND.slice(0, 80),
+    } as unknown as SDKMessage));
+    const ev = state.backgroundEvents?.find((e) => e.taskId === 'b1');
+    expect(ev?.status).toBe('completed');
+    expect(ev?.lastEvent).toBeUndefined();
+  });
+
+  it('keeps a real summary for shell tasks but strips URLs', () => {
+    const p = new StreamProcessor('hi');
+    bashToolUse(p, 'tu-1', '后台打开小红书链接');
+    p.processMessage(msg({
+      type: 'system', subtype: 'task_started', task_id: 'b1',
+      tool_use_id: 'tu-1', description: COMMAND,
+    } as unknown as SDKMessage));
+    const state = p.processMessage(msg({
+      type: 'system', subtype: 'task_notification', task_id: 'b1',
+      status: 'completed', summary: 'saved 6 notes from http://xhslink.cn/o/abc to notes/',
+    } as unknown as SDKMessage));
+    expect(state.backgroundEvents?.[0].lastEvent).toBe('saved 6 notes from [链接] to notes/');
+  });
+});
+
 describe('extractImagePaths', () => {
   it('extracts image paths from text', () => {
     const text = 'Created file at /tmp/img/chart.png and /home/user/photo.jpg';

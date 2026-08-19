@@ -6,7 +6,7 @@
  * truncation helpers.  This file is the single source of truth; import from
  * here — do NOT copy these into individual builder files.
  */
-import type { CardStatus } from '../types.js';
+import type { BackgroundEvent, CardStatus } from '../types.js';
 
 // ---------------------------------------------------------------------------
 // Status display config
@@ -34,6 +34,47 @@ export const BG_ICON: Record<'running' | 'completed' | 'failed' | 'stopped', str
   failed:    '❌',
   stopped:   '⏹️',
 };
+
+// ---------------------------------------------------------------------------
+// Background section rendering  [本地私改·patch R]
+// ---------------------------------------------------------------------------
+
+/** 逐条列出的（非 completed）后台任务行数上限，超出折叠成计数。 */
+const MAX_BG_LINES = 6;
+
+/**
+ * [本地私改·patch R] 后台任务区块统一渲染（v1/v2 builder 共用，勿各自复制）。
+ * 收敛规则——与工具行「用户只关心最终答案」同一哲学：
+ *   - 终卡（complete/error）整块隐藏，后台结果由最终回复正文交代；
+ *   - 只逐条列 failed/stopped/running（失败优先，保证可见），completed 折叠为计数；
+ *   - 逐条上限 MAX_BG_LINES，溢出折叠成「另有 N 个运行中」。
+ * 描述/lastEvent 的去代码化（人话关联、命令回显判重、去 URL）在数据层
+ * stream-processor 完成，这里只管排版。
+ */
+export function formatBackgroundSection(
+  events: BackgroundEvent[] | undefined,
+  status: CardStatus,
+): string | null {
+  if (!events || events.length === 0) return null;
+  if (status === 'complete' || status === 'error') return null;
+
+  const failed  = events.filter((ev) => ev.status === 'failed' || ev.status === 'stopped');
+  const running = events.filter((ev) => ev.status === 'running');
+  const done    = events.length - failed.length - running.length;
+
+  const listed = [...failed, ...running].slice(0, MAX_BG_LINES);
+  const lines = listed.map((ev) => {
+    const icon    = BG_ICON[ev.status];
+    const shortId = ev.taskId.slice(0, 6);
+    const desc    = truncate(ev.description, 60);
+    const last    = ev.lastEvent ? ` — _${truncate(ev.lastEvent, 100)}_` : '';
+    return `${icon} **${desc}** \`${shortId}\`${last}`;
+  });
+  const hidden = failed.length + running.length - listed.length;
+  if (hidden > 0) lines.push(`… 另有 ${hidden} 个运行中`);
+  if (done > 0) lines.push(`✅ ${done} 个已完成`);
+  return '📡 **Background**\n' + lines.join('\n');
+}
 
 // ---------------------------------------------------------------------------
 // Content truncation
