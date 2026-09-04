@@ -20,10 +20,6 @@ export interface CardActionEvent {
 
 export type CardActionHandler = (event: CardActionEvent) => void;
 
-// Cache for group member counts (to avoid calling Feishu API on every message)
-const MEMBER_COUNT_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const memberCountCache = new Map<string, { count: number; ts: number }>();
-
 // Cache for recent media messages in group chats (file/image sent without @mention).
 // When a user later @mentions the bot, cached media is attached automatically.
 // [本地私改·patch N] TTL 5 分钟太短：2026-07-21 13:29 缓存的两个文件，13:39 @bot 时
@@ -32,11 +28,17 @@ const memberCountCache = new Map<string, { count: number; ts: number }>();
 // WARN（含文件名），事后可从日志还原「用户发过什么、为什么没带上」。
 // 导出 cachePendingMedia/getCachedMedia/MEDIA_CACHE_TTL_MS 仅为单测；生产只有本文件用。
 export const MEDIA_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+// [本地私改·patch S] 缓存项扩展：私聊里未 @ 的文本（含引用回复的 parentId）与媒体同列
+// 按时间顺序暂存，@ 时文本按序拼到本回合提示词前面、媒体作为附件带上。
 interface CachedMedia {
   messageId: string;
   imageKey?: string;
   fileKey?: string;
   fileName?: string;
+  /** 未 @ 的文本消息正文（已剥 @ 标记）。 */
+  text?: string;
+  /** 该未 @ 消息本身是引用回复时，被引消息 id。 */
+  parentId?: string;
   ts: number;
 }
 const pendingMediaCache = new Map<string, CachedMedia[]>(); // key: chatId:userId
@@ -66,7 +68,7 @@ export function getCachedMedia(chatId: string, userId: string, logger?: Logger):
       {
         chatId,
         userId,
-        dropped: expired.map(m => m.fileName || m.imageKey || m.fileKey || m.messageId),
+        dropped: expired.map(m => m.fileName || m.imageKey || m.fileKey || (m.text ? m.text.slice(0, 60) : m.messageId)),
         oldestAgeMs: Math.max(...expired.map(m => now - m.ts)),
         ttlMs: MEDIA_CACHE_TTL_MS,
       },
@@ -103,19 +105,6 @@ function isDuplicateMessage(messageId: string): boolean {
   const seen = processedMessages.get(messageId);
   if (seen !== undefined && now - seen < PROCESSED_MSG_TTL_MS) return true;
   processedMessages.set(messageId, now);
-  return false;
-}
-
-async function isPrivateLikeGroup(chatId: string, sender: MessageSender): Promise<boolean> {
-  const cached = memberCountCache.get(chatId);
-  if (cached && Date.now() - cached.ts < MEMBER_COUNT_CACHE_TTL_MS) {
-    return cached.count === 2;
-  }
-  const count = await sender.getChatMemberCount(chatId);
-  if (count !== undefined) {
-    memberCountCache.set(chatId, { count, ts: Date.now() });
-    return count === 2;
-  }
   return false;
 }
 
@@ -166,7 +155,24 @@ export function createEventDispatcher(
   }
 
   dispatcher.register({
-    'im.message.receive_v1': async (data: any) => {
+    'im.message.receive_v1': createReceiveHandler(config, logger, onMessage, botOpenId, messageSender),
+  });
+
+  return dispatcher;
+}
+
+/**
+ * [本地私改·patch S] 接收处理器抽成独立工厂并导出：单测可以直接驱动整条链路
+ * （去重 / @ 门控 / 媒体与文本缓存 / 拼接），生产行为不变。
+ */
+export function createReceiveHandler(
+  config: BotConfig,
+  logger: Logger,
+  onMessage: MessageHandler,
+  botOpenId?: string,
+  messageSender?: MessageSender,
+): (data: any) => Promise<void> {
+  return async (data: any) => {
       try {
         const event = data;
         const message = event.message;
@@ -191,7 +197,7 @@ export function createEventDispatcher(
         const messageId = message.message_id;
         // [本地私改·patch P] 引用回复带 parent_id（被引消息 id）；桥接据此把被引内容注入回合上下文。
         // root_id 仅入日志，供「话题内普通消息是否误带 parent_id」这类语义边界的事后诊断。
-        const parentId = message.parent_id;
+        let parentId: string | undefined = message.parent_id;
         if (parentId) {
           logger.info({ chatId, userId, messageId, parentId, rootId: message.root_id }, 'Message is a quote-reply');
         }
@@ -219,31 +225,49 @@ export function createEventDispatcher(
           return;
         }
 
-        // In group chats, only respond when the bot is @mentioned
-        // Exceptions: 2-member groups are treated like DMs; groupNoMention mode skips @mention check
+        // [本地私改·patch S] 私聊也要 @bot 才回答，判定与群聊完全一致：
+        //   - 飞书私聊里 @ 弹得出机器人，mentions 里带 bot open_id，直接复用群聊判定，不做文本兜底；
+        //   - 未 @ 的消息静默丢弃（不回提示）；图片/文件先缓存，下次 @ 时自动带上；
+        //   - 上游对「两人群视同私聊免 @」的豁免（isPrivateLikeGroup）一并去掉——两人群就是群；
+        //   - groupNoMention 仍是唯一的免 @ 开关，对群聊和私聊同时生效。
+        // 谁能私聊由补丁 A 的 groupOnly 白名单决定，与本补丁正交。
         const mentions = message.mentions;
-        if (chatType === 'group') {
-          const botMentioned = botOpenId
-            ? mentions?.some((m: any) => m.id?.open_id === botOpenId)
-            : mentions && mentions.length > 0;
-          if (!botMentioned) {
-            // groupNoMention mode: respond to all messages without @mention
-            if (config.groupNoMention) {
-              logger.debug({ chatId }, 'Group no-mention mode enabled, processing without @mention');
-            } else if (messageSender && await isPrivateLikeGroup(chatId, messageSender)) {
-              logger.debug({ chatId }, 'Private-like group (2 members), processing without @mention');
-            } else if (msgType === 'image' || msgType === 'file') {
-              // Cache media messages for later retrieval when user @mentions bot
-              const media = parseMediaMessage(message, msgType, logger);
-              if (media) {
-                cachePendingMedia(chatId, userId, { ...media, messageId, ts: Date.now() });
-                logger.info({ chatId, userId, msgType, ...media }, 'Cached group media for later @mention');
-              }
-              return;
-            } else {
-              logger.debug('Ignoring group message without @mention');
-              return;
+        const botMentioned = botOpenId
+          ? mentions?.some((m: any) => m.id?.open_id === botOpenId)
+          : mentions && mentions.length > 0;
+        if (!botMentioned) {
+          // groupNoMention mode: respond to all messages without @mention
+          if (config.groupNoMention) {
+            logger.debug({ chatId, chatType }, 'No-mention mode enabled, processing without @mention');
+          } else if (msgType === 'image' || msgType === 'file') {
+            // Cache media messages for later retrieval when user @mentions bot
+            const media = parseMediaMessage(message, msgType, logger);
+            if (media) {
+              cachePendingMedia(chatId, userId, { ...media, messageId, ts: Date.now() });
+              logger.info({ chatId, chatType, userId, msgType, ...media }, 'Cached media for later @mention');
             }
+            return;
+          } else if (chatType === 'p2p') {
+            // [本地私改·patch S] 私聊里未 @ 的文本先暂存（团队习惯：先发链接/要求，最后 @ 一句
+            // 「处理」）。0904 生产实锤：KK 私聊发的链接与要求全被静默丢弃，bot 只拿到
+            // 「处理以上需求」。群聊不缓存文本——群里未 @ 的闲聊不是说给 bot 的。
+            const parsed = extractPromptText(message, msgType, logger);
+            if (parsed) {
+              if (parsed.text) {
+                cachePendingMedia(chatId, userId, { messageId, text: parsed.text, parentId, ts: Date.now() });
+              }
+              for (const key of parsed.postImages) {
+                cachePendingMedia(chatId, userId, { messageId, imageKey: key, ts: Date.now() });
+              }
+              logger.info(
+                { chatId, userId, msgType, text: parsed.text.slice(0, 100), postImageCount: parsed.postImages.length, parentId },
+                'Cached private text for later @mention',
+              );
+            }
+            return;
+          } else {
+            logger.debug({ chatId, chatType }, 'Ignoring message without @mention');
+            return;
           }
         }
 
@@ -284,41 +308,18 @@ export function createEventDispatcher(
           }
           text = '请分析这个文件';
           logger.info({ userId, chatId, chatType, fileKey, fileName }, 'Received file message');
-        } else if (msgType === 'post') {
-          // Rich text (post) message: extract plain text and images from nested structure
-          try {
-            const content = JSON.parse(message.content);
-            logger.debug({ postContent: JSON.stringify(content).slice(0, 500) }, 'Raw post content');
-            text = extractTextFromPost(content);
-            const postImages = extractImagesFromPost(content);
-            if (postImages.length > 0) {
-              imageKey = postImages[0];
-              postExtraImages = postImages.slice(1);
-            }
-            logger.debug({ extractedText: text.slice(0, 200), imageKey, postImageCount: postImages.length }, 'Extracted post content');
-          } catch {
-            logger.warn({ content: message.content }, 'Failed to parse post message content');
-            return;
-          }
         } else {
-          // Text message: extract and clean text
-          try {
-            const content = JSON.parse(message.content);
-            text = content.text || '';
-          } catch {
-            logger.warn({ content: message.content }, 'Failed to parse message content');
-            return;
+          // Text / rich text (post): extract, clean, split post images
+          const parsed = extractPromptText(message, msgType, logger);
+          if (!parsed) return;
+          text = parsed.text;
+          if (parsed.postImages.length > 0) {
+            imageKey = parsed.postImages[0];
+            postExtraImages = parsed.postImages.slice(1);
           }
         }
 
-        // Common text cleanup for text and post messages
         if (msgType === 'text' || msgType === 'post') {
-          // Strip @mention tags (format: @_user_xxx or similar)
-          text = text.replace(/@_\w+\s*/g, '').trim();
-
-          // Strip Feishu auto-generated markdown links: [text](url) → text
-          text = text.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
-
           if (!text && !imageKey) {
             logger.debug('Empty message after stripping mentions');
             return;
@@ -341,29 +342,72 @@ export function createEventDispatcher(
           }));
           logger.info({ chatId, postExtraImageCount: postExtraImages.length }, 'Attached extra images from post');
         }
-        if (chatType === 'group') {
-          const cached = getCachedMedia(chatId, userId, logger); // [本地私改·patch N] 过期丢弃要打 WARN
-          if (cached.length > 0) {
-            const cachedMedia = cached.map(m => ({
+        // [本地私改·patch S] 接回未 @ 时缓存的内容（私聊与群聊同一路径）：
+        //   媒体 → 附件；文本 → 按时间顺序拼在本条正文前面，触发消息永远在最后；
+        //   本条不是引用回复而缓存里有引用回复时，沿用最早那条的 parentId，让补丁 P 的
+        //   被引内容注入照常工作（只支持一条，多条时后面的被引内容不注入，日志可查）。
+        const cached = getCachedMedia(chatId, userId, logger); // [本地私改·patch N] 过期丢弃要打 WARN
+        if (cached.length > 0) {
+          const cachedMedia = cached
+            .filter(m => m.imageKey || m.fileKey)
+            .map(m => ({
               messageId: m.messageId,
               imageKey: m.imageKey,
               fileKey: m.fileKey,
               fileName: m.fileName,
             }));
+          if (cachedMedia.length > 0) {
             extraMedia = extraMedia ? [...extraMedia, ...cachedMedia] : cachedMedia;
-            clearCachedMedia(chatId, userId);
-            logger.info({ chatId, userId, mediaCount: cached.length }, 'Attached cached media to @mention message');
           }
+          const cachedTexts = cached.filter(m => m.text);
+          if (cachedTexts.length > 0) {
+            text = [...cachedTexts.map(m => m.text as string), text].join('\n\n');
+            if (!parentId) {
+              parentId = cachedTexts.find(m => m.parentId)?.parentId;
+            }
+          }
+          clearCachedMedia(chatId, userId);
+          logger.info(
+            { chatId, userId, mediaCount: cachedMedia.length, textCount: cachedTexts.length, parentId },
+            'Attached cached content to @mention message',
+          );
         }
 
         onMessage({ messageId, chatId, chatType, userId, parentId, text, imageKey, fileKey, fileName, extraMedia });
       } catch (err) {
         logger.error({ err }, 'Error handling message event');
       }
-    },
-  });
+    };
+}
 
-  return dispatcher;
+/**
+ * [本地私改·patch S] 文本/富文本消息的正文抽取 + 通用清理，收口成函数供主路径与
+ * 「未 @ 先缓存」两处共用。返回 undefined 表示内容解析失败。
+ */
+function extractPromptText(
+  message: any, msgType: 'text' | 'post', logger: Logger,
+): { text: string; postImages: string[] } | undefined {
+  let text: string;
+  let postImages: string[] = [];
+  try {
+    const content = JSON.parse(message.content);
+    if (msgType === 'post') {
+      logger.debug({ postContent: JSON.stringify(content).slice(0, 500) }, 'Raw post content');
+      text = extractTextFromPost(content);
+      postImages = extractImagesFromPost(content);
+      logger.debug({ extractedText: text.slice(0, 200), postImageCount: postImages.length }, 'Extracted post content');
+    } else {
+      text = content.text || '';
+    }
+  } catch {
+    logger.warn({ content: message.content }, 'Failed to parse message content');
+    return undefined;
+  }
+  // Strip @mention tags (format: @_user_xxx or similar)
+  text = text.replace(/@_\w+\s*/g, '').trim();
+  // Strip Feishu auto-generated markdown links: [text](url) → text
+  text = text.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
+  return { text, postImages };
 }
 
 /** Parse image/file message content, returning media fields or undefined on failure. */
@@ -465,7 +509,14 @@ export function extractTextFromPost(content: Record<string, unknown>): string {
       for (const element of paragraph) {
         if (!element || typeof element !== 'object') continue;
         const el = element as Record<string, unknown>;
-        if ((el.tag === 'text' || el.tag === 'a') && typeof el.text === 'string') {
+        if (el.tag === 'a' && typeof el.text === 'string') {
+          // [本地私改·patch S] 富文本链接原先只取显示文字、丢掉 href——粘贴的飞书文档链接
+          // 到 bot 手里只剩标题，无从打开。显示文字本身就是 URL 时不重复。
+          const href = typeof el.href === 'string' ? el.href.trim() : '';
+          const label = el.text.trim();
+          if (href && href !== label) line.push(`${label} (${href})`);
+          else line.push(el.text);
+        } else if (el.tag === 'text' && typeof el.text === 'string') {
           line.push(el.text);
         }
       }
