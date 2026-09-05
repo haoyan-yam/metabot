@@ -1,560 +1,352 @@
-diff --git a/src/feishu/event-handler.ts b/src/feishu/event-handler.ts
-index 8c6da0a..a5b7bf1 100644
---- a/src/feishu/event-handler.ts
-+++ b/src/feishu/event-handler.ts
-@@ -20,10 +20,6 @@ export interface CardActionEvent {
+diff --git a/src/bridge/message-bridge.ts b/src/bridge/message-bridge.ts
+index 27eb210..0fd6d34 100644
+--- a/src/bridge/message-bridge.ts
++++ b/src/bridge/message-bridge.ts
+@@ -22,6 +22,7 @@ import {
+   resolveEngineName,
+   StreamProcessor,
+   SessionManager,
++  type UserSession,
+ } from '../engines/index.js';
+ import { listClaudeSessions, type SessionSummary } from '../engines/claude/session-lister.js';
+ import { ExecutorRegistry } from '../engines/claude/executor-registry.js';
+@@ -1976,43 +1977,9 @@ export class MessageBridge {
+     const activeEngine = session.engine ?? resolveEngineName(this.config);
+     const enginePromptText = normalizePromptForEngine(text, activeEngine);
  
- export type CardActionHandler = (event: CardActionEvent) => void;
+-    // [本地私改·patch T] 空闲 ≥3h 且已压缩过的会话：本回合开新会话，并把旧会话最近几轮
+-    // 作为交接注入。判定与渲染是纯函数（session-rollover.ts），这里只做编排；任何一步
+-    // 出错都退回「照常 resume」，绝不让本回合失败。交接内容要在清掉 sessionId 之前取。
+-    let rolledOver = false;
+-    let handoffReminder: string | undefined;
+-    try {
+-      const decision = decideRollover({
+-        cwd,
+-        sessionId: session.sessionId,
+-        engine: engineName,
+-        hasActiveGoal: !!session.activeGoal,
+-      });
+-      this.logger.debug({ chatId, ...decision, transcriptPath: undefined }, 'session rollover check');
+-      if (decision.rollover) {
+-        handoffReminder = this.buildHandoffReminder(chatId, decision.idleMs ?? 0);
+-        const previousSessionId = this.sessionManager.rolloverSession(chatId);
+-        try {
+-          await this.releaseChatExecutor(chatId, 'idle-compacted-rollover');
+-        } catch (err) {
+-          this.logger.warn({ err, chatId }, 'rollover: failed to release persistent executor');
+-        }
+-        rolledOver = true;
+-        const idleHours = Math.round(((decision.idleMs ?? 0) / 3_600_000) * 10) / 10;
+-        this.logger.info({ chatId, previousSessionId, idleHours, handoff: !!handoffReminder }, 'session rolled over: idle + compacted');
+-        this.audit.log({
+-          event: 'session_rollover',
+-          botName: this.config.name,
+-          chatId,
+-          userId,
+-          meta: { previousSessionId, idleHours, handoff: !!handoffReminder },
+-        });
+-      }
+-    } catch (err) {
+-      this.logger.warn({ err, chatId }, 'session rollover check failed; resuming as usual');
+-      rolledOver = false;
+-      handoffReminder = undefined;
+-    }
++    // [本地私改·patch T] 空闲 ≥3h 且已压缩过的会话：本回合开新会话并注入交接（编排见
++    // maybeRolloverSession；群消息入口与 API/定时任务入口共用同一段逻辑）。
++    const { rolledOver, handoffReminder } = await this.maybeRolloverSession(chatId, session, engineName, userId, 'message');
  
--// Cache for group member counts (to avoid calling Feishu API on every message)
--const MEMBER_COUNT_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
--const memberCountCache = new Map<string, { count: number; ts: number }>();
--
- // Cache for recent media messages in group chats (file/image sent without @mention).
- // When a user later @mentions the bot, cached media is attached automatically.
- // [本地私改·patch N] TTL 5 分钟太短：2026-07-21 13:29 缓存的两个文件，13:39 @bot 时
-@@ -32,11 +28,17 @@ const memberCountCache = new Map<string, { count: number; ts: number }>();
- // WARN（含文件名），事后可从日志还原「用户发过什么、为什么没带上」。
- // 导出 cachePendingMedia/getCachedMedia/MEDIA_CACHE_TTL_MS 仅为单测；生产只有本文件用。
- export const MEDIA_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
-+// [本地私改·patch S] 缓存项扩展：私聊里未 @ 的文本（含引用回复的 parentId）与媒体同列
-+// 按时间顺序暂存，@ 时文本按序拼到本回合提示词前面、媒体作为附件带上。
- interface CachedMedia {
-   messageId: string;
-   imageKey?: string;
-   fileKey?: string;
-   fileName?: string;
-+  /** 未 @ 的文本消息正文（已剥 @ 标记）。 */
-+  text?: string;
-+  /** 该未 @ 消息本身是引用回复时，被引消息 id。 */
-+  parentId?: string;
-   ts: number;
- }
- const pendingMediaCache = new Map<string, CachedMedia[]>(); // key: chatId:userId
-@@ -66,7 +68,7 @@ export function getCachedMedia(chatId: string, userId: string, logger?: Logger):
-       {
-         chatId,
-         userId,
--        dropped: expired.map(m => m.fileName || m.imageKey || m.fileKey || m.messageId),
-+        dropped: expired.map(m => m.fileName || m.imageKey || m.fileKey || (m.text ? m.text.slice(0, 60) : m.messageId)),
-         oldestAgeMs: Math.max(...expired.map(m => now - m.ts)),
-         ttlMs: MEDIA_CACHE_TTL_MS,
-       },
-@@ -106,19 +108,6 @@ function isDuplicateMessage(messageId: string): boolean {
-   return false;
- }
+     // Prepare downloads directory (bot-isolated)
+     const downloadsDir = this.config.claude.downloadsDir;
+@@ -2684,6 +2651,17 @@ export class MessageBridge {
+     const cwd = session.workingDirectory;
+     const abortController = new AbortController();
  
--async function isPrivateLikeGroup(chatId: string, sender: MessageSender): Promise<boolean> {
--  const cached = memberCountCache.get(chatId);
--  if (cached && Date.now() - cached.ts < MEMBER_COUNT_CACHE_TTL_MS) {
--    return cached.count === 2;
--  }
--  const count = await sender.getChatMemberCount(chatId);
--  if (count !== undefined) {
--    memberCountCache.set(chatId, { count, ts: Date.now() });
--    return count === 2;
--  }
--  return false;
--}
--
- export function createEventDispatcher(
-   config: BotConfig,
-   logger: Logger,
-@@ -166,7 +155,24 @@ export function createEventDispatcher(
-   }
- 
-   dispatcher.register({
--    'im.message.receive_v1': async (data: any) => {
-+    'im.message.receive_v1': createReceiveHandler(config, logger, onMessage, botOpenId, messageSender),
-+  });
-+
-+  return dispatcher;
-+}
-+
-+/**
-+ * [本地私改·patch S] 接收处理器抽成独立工厂并导出：单测可以直接驱动整条链路
-+ * （去重 / @ 门控 / 媒体与文本缓存 / 拼接），生产行为不变。
-+ */
-+export function createReceiveHandler(
-+  config: BotConfig,
-+  logger: Logger,
-+  onMessage: MessageHandler,
-+  botOpenId?: string,
-+  messageSender?: MessageSender,
-+): (data: any) => Promise<void> {
-+  return async (data: any) => {
-       try {
-         const event = data;
-         const message = event.message;
-@@ -191,7 +197,7 @@ export function createEventDispatcher(
-         const messageId = message.message_id;
-         // [本地私改·patch P] 引用回复带 parent_id（被引消息 id）；桥接据此把被引内容注入回合上下文。
-         // root_id 仅入日志，供「话题内普通消息是否误带 parent_id」这类语义边界的事后诊断。
--        const parentId = message.parent_id;
-+        let parentId: string | undefined = message.parent_id;
-         if (parentId) {
-           logger.info({ chatId, userId, messageId, parentId, rootId: message.root_id }, 'Message is a quote-reply');
-         }
-@@ -219,31 +225,49 @@ export function createEventDispatcher(
-           return;
-         }
- 
--        // In group chats, only respond when the bot is @mentioned
--        // Exceptions: 2-member groups are treated like DMs; groupNoMention mode skips @mention check
-+        // [本地私改·patch S] 私聊也要 @bot 才回答，判定与群聊完全一致：
-+        //   - 飞书私聊里 @ 弹得出机器人，mentions 里带 bot open_id，直接复用群聊判定，不做文本兜底；
-+        //   - 未 @ 的消息静默丢弃（不回提示）；图片/文件先缓存，下次 @ 时自动带上；
-+        //   - 上游对「两人群视同私聊免 @」的豁免（isPrivateLikeGroup）一并去掉——两人群就是群；
-+        //   - groupNoMention 仍是唯一的免 @ 开关，对群聊和私聊同时生效。
-+        // 谁能私聊由补丁 A 的 groupOnly 白名单决定，与本补丁正交。
-         const mentions = message.mentions;
--        if (chatType === 'group') {
--          const botMentioned = botOpenId
--            ? mentions?.some((m: any) => m.id?.open_id === botOpenId)
--            : mentions && mentions.length > 0;
--          if (!botMentioned) {
--            // groupNoMention mode: respond to all messages without @mention
--            if (config.groupNoMention) {
--              logger.debug({ chatId }, 'Group no-mention mode enabled, processing without @mention');
--            } else if (messageSender && await isPrivateLikeGroup(chatId, messageSender)) {
--              logger.debug({ chatId }, 'Private-like group (2 members), processing without @mention');
--            } else if (msgType === 'image' || msgType === 'file') {
--              // Cache media messages for later retrieval when user @mentions bot
--              const media = parseMediaMessage(message, msgType, logger);
--              if (media) {
--                cachePendingMedia(chatId, userId, { ...media, messageId, ts: Date.now() });
--                logger.info({ chatId, userId, msgType, ...media }, 'Cached group media for later @mention');
-+        const botMentioned = botOpenId
-+          ? mentions?.some((m: any) => m.id?.open_id === botOpenId)
-+          : mentions && mentions.length > 0;
-+        if (!botMentioned) {
-+          // groupNoMention mode: respond to all messages without @mention
-+          if (config.groupNoMention) {
-+            logger.debug({ chatId, chatType }, 'No-mention mode enabled, processing without @mention');
-+          } else if (msgType === 'image' || msgType === 'file') {
-+            // Cache media messages for later retrieval when user @mentions bot
-+            const media = parseMediaMessage(message, msgType, logger);
-+            if (media) {
-+              cachePendingMedia(chatId, userId, { ...media, messageId, ts: Date.now() });
-+              logger.info({ chatId, chatType, userId, msgType, ...media }, 'Cached media for later @mention');
-+            }
-+            return;
-+          } else if (chatType === 'p2p') {
-+            // [本地私改·patch S] 私聊里未 @ 的文本先暂存（团队习惯：先发链接/要求，最后 @ 一句
-+            // 「处理」）。0904 生产实锤：KK 私聊发的链接与要求全被静默丢弃，bot 只拿到
-+            // 「处理以上需求」。群聊不缓存文本——群里未 @ 的闲聊不是说给 bot 的。
-+            const parsed = extractPromptText(message, msgType, logger);
-+            if (parsed) {
-+              if (parsed.text) {
-+                cachePendingMedia(chatId, userId, { messageId, text: parsed.text, parentId, ts: Date.now() });
-+              }
-+              for (const key of parsed.postImages) {
-+                cachePendingMedia(chatId, userId, { messageId, imageKey: key, ts: Date.now() });
-               }
--              return;
--            } else {
--              logger.debug('Ignoring group message without @mention');
--              return;
-+              logger.info(
-+                { chatId, userId, msgType, text: parsed.text.slice(0, 100), postImageCount: parsed.postImages.length, parentId },
-+                'Cached private text for later @mention',
-+              );
-             }
-+            return;
-+          } else {
-+            logger.debug({ chatId, chatType }, 'Ignoring message without @mention');
-+            return;
-           }
-         }
- 
-@@ -284,41 +308,18 @@ export function createEventDispatcher(
-           }
-           text = '请分析这个文件';
-           logger.info({ userId, chatId, chatType, fileKey, fileName }, 'Received file message');
--        } else if (msgType === 'post') {
--          // Rich text (post) message: extract plain text and images from nested structure
--          try {
--            const content = JSON.parse(message.content);
--            logger.debug({ postContent: JSON.stringify(content).slice(0, 500) }, 'Raw post content');
--            text = extractTextFromPost(content);
--            const postImages = extractImagesFromPost(content);
--            if (postImages.length > 0) {
--              imageKey = postImages[0];
--              postExtraImages = postImages.slice(1);
--            }
--            logger.debug({ extractedText: text.slice(0, 200), imageKey, postImageCount: postImages.length }, 'Extracted post content');
--          } catch {
--            logger.warn({ content: message.content }, 'Failed to parse post message content');
--            return;
--          }
-         } else {
--          // Text message: extract and clean text
--          try {
--            const content = JSON.parse(message.content);
--            text = content.text || '';
--          } catch {
--            logger.warn({ content: message.content }, 'Failed to parse message content');
--            return;
-+          // Text / rich text (post): extract, clean, split post images
-+          const parsed = extractPromptText(message, msgType, logger);
-+          if (!parsed) return;
-+          text = parsed.text;
-+          if (parsed.postImages.length > 0) {
-+            imageKey = parsed.postImages[0];
-+            postExtraImages = parsed.postImages.slice(1);
-           }
-         }
- 
--        // Common text cleanup for text and post messages
-         if (msgType === 'text' || msgType === 'post') {
--          // Strip @mention tags (format: @_user_xxx or similar)
--          text = text.replace(/@_\w+\s*/g, '').trim();
--
--          // Strip Feishu auto-generated markdown links: [text](url) → text
--          text = text.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
--
-           if (!text && !imageKey) {
-             logger.debug('Empty message after stripping mentions');
-             return;
-@@ -341,29 +342,72 @@ export function createEventDispatcher(
-           }));
-           logger.info({ chatId, postExtraImageCount: postExtraImages.length }, 'Attached extra images from post');
-         }
--        if (chatType === 'group') {
--          const cached = getCachedMedia(chatId, userId, logger); // [本地私改·patch N] 过期丢弃要打 WARN
--          if (cached.length > 0) {
--            const cachedMedia = cached.map(m => ({
-+        // [本地私改·patch S] 接回未 @ 时缓存的内容（私聊与群聊同一路径）：
-+        //   媒体 → 附件；文本 → 按时间顺序拼在本条正文前面，触发消息永远在最后；
-+        //   本条不是引用回复而缓存里有引用回复时，沿用最早那条的 parentId，让补丁 P 的
-+        //   被引内容注入照常工作（只支持一条，多条时后面的被引内容不注入，日志可查）。
-+        const cached = getCachedMedia(chatId, userId, logger); // [本地私改·patch N] 过期丢弃要打 WARN
-+        if (cached.length > 0) {
-+          const cachedMedia = cached
-+            .filter(m => m.imageKey || m.fileKey)
-+            .map(m => ({
-               messageId: m.messageId,
-               imageKey: m.imageKey,
-               fileKey: m.fileKey,
-               fileName: m.fileName,
-             }));
-+          if (cachedMedia.length > 0) {
-             extraMedia = extraMedia ? [...extraMedia, ...cachedMedia] : cachedMedia;
--            clearCachedMedia(chatId, userId);
--            logger.info({ chatId, userId, mediaCount: cached.length }, 'Attached cached media to @mention message');
-           }
-+          const cachedTexts = cached.filter(m => m.text);
-+          if (cachedTexts.length > 0) {
-+            text = [...cachedTexts.map(m => m.text as string), text].join('\n\n');
-+            if (!parentId) {
-+              parentId = cachedTexts.find(m => m.parentId)?.parentId;
-+            }
-+          }
-+          clearCachedMedia(chatId, userId);
-+          logger.info(
-+            { chatId, userId, mediaCount: cachedMedia.length, textCount: cachedTexts.length, parentId },
-+            'Attached cached content to @mention message',
-+          );
-         }
- 
-         onMessage({ messageId, chatId, chatType, userId, parentId, text, imageKey, fileKey, fileName, extraMedia });
-       } catch (err) {
-         logger.error({ err }, 'Error handling message event');
-       }
--    },
--  });
-+    };
-+}
- 
--  return dispatcher;
-+/**
-+ * [本地私改·patch S] 文本/富文本消息的正文抽取 + 通用清理，收口成函数供主路径与
-+ * 「未 @ 先缓存」两处共用。返回 undefined 表示内容解析失败。
-+ */
-+function extractPromptText(
-+  message: any, msgType: 'text' | 'post', logger: Logger,
-+): { text: string; postImages: string[] } | undefined {
-+  let text: string;
-+  let postImages: string[] = [];
-+  try {
-+    const content = JSON.parse(message.content);
-+    if (msgType === 'post') {
-+      logger.debug({ postContent: JSON.stringify(content).slice(0, 500) }, 'Raw post content');
-+      text = extractTextFromPost(content);
-+      postImages = extractImagesFromPost(content);
-+      logger.debug({ extractedText: text.slice(0, 200), postImageCount: postImages.length }, 'Extracted post content');
-+    } else {
-+      text = content.text || '';
++    // [本地私改·patch T] 定时任务（每日群总结）/ API 任务 / 跨 bot 委派也走换新判定——否则
++    // 8 点的日报会在旧会话里跑并把空闲计时归零，白天第一条人话要到 3 小时后才换新。
++    // 带 maxTurns / allowedTools 的受限回合（语音等）不参与：它们本就走一次性 legacy spawn。
++    let taskPrompt = prompt;
++    let rolledOver = false;
++    if (options.maxTurns === undefined && options.allowedTools === undefined) {
++      const r = await this.maybeRolloverSession(chatId, session, engineName, userId, 'api');
++      rolledOver = r.rolledOver;
++      if (r.rolledOver && r.handoffReminder) taskPrompt = `${r.handoffReminder}\n\n${prompt}`;
 +    }
-+  } catch {
-+    logger.warn({ content: message.content }, 'Failed to parse message content');
-+    return undefined;
-+  }
-+  // Strip @mention tags (format: @_user_xxx or similar)
-+  text = text.replace(/@_\w+\s*/g, '').trim();
-+  // Strip Feishu auto-generated markdown links: [text](url) → text
-+  text = text.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
-+  return { text, postImages };
- }
++
+     // [本地私改·补丁 Q] 清空前先补扫:残留 = 漏发文件(发过即删),先发出去再清
+     await this.outputHandler.sweepDir(chatId, this.outputsManager.dirFor(chatId));
+     const outputsDir = this.outputsManager.prepareDir(chatId);
+@@ -2741,7 +2719,7 @@ export class MessageBridge {
+     // them per-turn — runOneTurn falls back to legacy spawn automatically
+     // when those are set.
+     const executionHandle = await this.runOneTurn(chatId, engineName, {
+-      prompt,
++      prompt: taskPrompt,
+       cwd,
+       abortController,
+       outputsDir,
+@@ -2750,6 +2728,8 @@ export class MessageBridge {
+       model: options.model ?? session.model,
+       allowedTools: options.allowedTools,
+       onTeamEvent,
++      // [本地私改·patch T] 换新会话时不 resume
++      freshSession: rolledOver,
+     });
  
- /** Parse image/file message content, returning media fields or undefined on failure. */
-@@ -465,7 +509,14 @@ export function extractTextFromPost(content: Record<string, unknown>): string {
-       for (const element of paragraph) {
-         if (!element || typeof element !== 'object') continue;
-         const el = element as Record<string, unknown>;
--        if ((el.tag === 'text' || el.tag === 'a') && typeof el.text === 'string') {
-+        if (el.tag === 'a' && typeof el.text === 'string') {
-+          // [本地私改·patch S] 富文本链接原先只取显示文字、丢掉 href——粘贴的飞书文档链接
-+          // 到 bot 手里只剩标题，无从打开。显示文字本身就是 URL 时不重复。
-+          const href = typeof el.href === 'string' ? el.href.trim() : '';
-+          const label = el.text.trim();
-+          if (href && href !== label) line.push(`${label} (${href})`);
-+          else line.push(el.text);
-+        } else if (el.tag === 'text' && typeof el.text === 'string') {
-           line.push(el.text);
-         }
-       }
-diff --git a/tests/feishu-mention-gating.test.ts b/tests/feishu-mention-gating.test.ts
+     const startTime = Date.now();
+@@ -3091,6 +3071,50 @@ export class MessageBridge {
+    * Card updates don't trigger Feishu mobile push notifications, but new messages do.
+    * Only sends for tasks that took longer than 10 seconds.
+    */
++  /**
++   * [本地私改·patch T] 换新会话编排：判定（纯函数）→ 先取交接 → 清 sessionId → 释放
++   * persistent executor → 审计。任何一步出错都返回「不换」，绝不让本回合失败。
++   * 群消息入口（executeQuery）与 API/定时任务入口（executeApiTask）共用。
++   */
++  private async maybeRolloverSession(
++    chatId: string,
++    session: UserSession,
++    engineName: EngineName,
++    userId: string | undefined,
++    source: 'message' | 'api',
++  ): Promise<{ rolledOver: boolean; handoffReminder?: string }> {
++    try {
++      const decision = decideRollover({
++        cwd: session.workingDirectory,
++        sessionId: session.sessionId,
++        engine: engineName,
++        hasActiveGoal: !!session.activeGoal,
++      });
++      this.logger.debug({ chatId, source, ...decision, transcriptPath: undefined }, 'session rollover check');
++      if (!decision.rollover) return { rolledOver: false };
++      const handoffReminder = this.buildHandoffReminder(chatId, decision.idleMs ?? 0);
++      const previousSessionId = this.sessionManager.rolloverSession(chatId);
++      try {
++        await this.releaseChatExecutor(chatId, 'idle-compacted-rollover');
++      } catch (err) {
++        this.logger.warn({ err, chatId }, 'rollover: failed to release persistent executor');
++      }
++      const idleHours = Math.round(((decision.idleMs ?? 0) / 3_600_000) * 10) / 10;
++      this.logger.info({ chatId, source, previousSessionId, idleHours, handoff: !!handoffReminder }, 'session rolled over: idle + compacted');
++      this.audit.log({
++        event: 'session_rollover',
++        botName: this.config.name,
++        chatId,
++        userId,
++        meta: { source, previousSessionId, idleHours, handoff: !!handoffReminder },
++      });
++      return { rolledOver: true, handoffReminder };
++    } catch (err) {
++      this.logger.warn({ err, chatId, source }, 'session rollover check failed; resuming as usual');
++      return { rolledOver: false };
++    }
++  }
++
+   /**
+    * [本地私改·patch T] 从 SessionRegistry 取本群最近几轮（只含真正到达 bot 的回合）
+    * 渲染成交接块。没有 registry / 没有记录 → undefined（新会话照开，只是不带交接）。
+diff --git a/tests/session-rollover-bridge.test.ts b/tests/session-rollover-bridge.test.ts
 new file mode 100644
-index 0000000..2ffdce7
+index 0000000..464ca20
 --- /dev/null
-+++ b/tests/feishu-mention-gating.test.ts
-@@ -0,0 +1,238 @@
-+import { describe, it, expect } from 'vitest';
-+import { createReceiveHandler, extractTextFromPost } from '../src/feishu/event-handler.js';
-+import type { BotConfig } from '../src/config.js';
-+import type { IncomingMessage } from '../src/types.js';
++++ b/tests/session-rollover-bridge.test.ts
+@@ -0,0 +1,200 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import * as fs from 'node:fs';
++import * as os from 'node:os';
++import * as path from 'node:path';
++import { MessageBridge } from '../src/bridge/message-bridge.js';
++import { _resetScanCache, transcriptPathFor } from '../src/bridge/session-rollover.js';
++import type { BotConfigBase } from '../src/config.js';
 +
 +/**
-+ * [本地私改·patch S] @ 门控与「未 @ 先缓存」全链路。
-+ *
-+ * 2026-09-04 生产事故：补丁 S 上线后，KK 在私聊里先发链接与要求、最后 @ 一句
-+ * 「处理以上需求」——前面的文本全被静默丢弃，bot 只拿到最后一句。这些用例锁定：
-+ *   1. 私聊/群聊/两人群都要 @；未 @ 静默、不回提示。
-+ *   2. 私聊未 @ 的文本（含引用回复的 parentId）与媒体一起暂存，@ 时按时间顺序拼回，
-+ *      触发消息永远在最后；缓存只消费一次、按发送人隔离。
-+ *   3. 群聊未 @ 的文本不缓存（群里闲聊不是说给 bot 的），媒体照旧缓存。
-+ *   4. 富文本链接保留 href，粘贴的文档链接不再只剩标题。
-+ *
-+ * 处理器有模块级缓存（去重 message_id / chat:user 媒体文本），每个用例用新 id 隔离。
++ * [本地私改·patch T] 桥接层编排：群消息入口与 API/定时任务入口共用 maybeRolloverSession。锁定：
++ *   - 条件满足 → 清 sessionId、审计 session_rollover、交接块来自 SessionRegistry；
++ *   - 条件不满足 → 原样 resume；
++ *   - executeApiTask（定时日报/API 任务）也换新：runOneTurn 收到 freshSession=true 且 prompt 顶部是交接块；
++ *   - 带 maxTurns 的受限回合（语音）不参与。
 + */
 +
-+const BOT = 'ou_bot';
-+const logger: any = { debug() {}, info() {}, warn() {}, error() {} };
-+let seq = 0;
-+const fresh = (prefix: string) => `${prefix}_${process.pid}_${Date.now()}_${++seq}`;
++const COMPACT_LINE = '{"type":"system","subtype":"compact_boundary","content":"Conversation compacted"}\n';
++const H = 3_600_000;
++const SID = '22222222-3333-4444-8555-666666666666';
 +
-+interface EvOpts { chatId: string; chatType: 'p2p' | 'group'; userId?: string; mention?: boolean; parentId?: string }
-+const mentions = (on?: boolean) => (on ? [{ key: '@_user_1', id: { open_id: BOT }, name: 'bot' }] : []);
-+const sender = (o: EvOpts) => ({ sender_id: { open_id: o.userId ?? 'ou_u1' }, sender_type: 'user' });
++let tmp: string;
++let savedHome: string | undefined;
++let savedStore: string | undefined;
++const auditCalls: any[] = [];
 +
-+function textEvent(o: EvOpts & { text: string }) {
-+  return {
-+    message: {
-+      message_id: fresh('om'), chat_id: o.chatId, chat_type: o.chatType, message_type: 'text',
-+      content: JSON.stringify({ text: o.mention ? `@_user_1 ${o.text}` : o.text }),
-+      mentions: mentions(o.mention), parent_id: o.parentId,
++const logger: any = {
++  debug: () => {},
++  info: (obj: any) => {
++    if (obj && obj.audit === true && obj.event) auditCalls.push(obj);
++  },
++  warn: () => {},
++  error: () => {},
++  child: (bindings: any) => ({
++    ...logger,
++    info: (obj: any, msg?: string) => {
++      const merged = { ...bindings, ...obj };
++      if (merged.audit === true) auditCalls.push({ ...merged, msg });
 +    },
-+    sender: sender(o),
-+  };
-+}
-+function imageEvent(o: EvOpts & { imageKey: string }) {
++  }),
++};
++
++function makeConfig(cwd: string): BotConfigBase {
 +  return {
-+    message: {
-+      message_id: fresh('om'), chat_id: o.chatId, chat_type: o.chatType, message_type: 'image',
-+      content: JSON.stringify({ image_key: o.imageKey }), mentions: mentions(o.mention),
++    name: 'test-bot',
++    engine: 'claude',
++    claude: {
++      defaultWorkingDirectory: cwd,
++      maxTurns: undefined,
++      maxBudgetUsd: undefined,
++      model: undefined,
++      apiKey: undefined,
++      outputsBaseDir: path.join(tmp, 'outputs'),
++      downloadsDir: path.join(tmp, 'downloads'),
++      backend: 'pty',
 +    },
-+    sender: sender(o),
-+  };
-+}
-+function fileEvent(o: EvOpts & { fileKey: string; fileName: string }) {
-+  return {
-+    message: {
-+      message_id: fresh('om'), chat_id: o.chatId, chat_type: o.chatType, message_type: 'file',
-+      content: JSON.stringify({ file_key: o.fileKey, file_name: o.fileName }), mentions: [],
-+    },
-+    sender: sender(o),
-+  };
-+}
-+function postEvent(o: EvOpts & { paragraphs: unknown[][] }) {
-+  return {
-+    message: {
-+      message_id: fresh('om'), chat_id: o.chatId, chat_type: o.chatType, message_type: 'post',
-+      content: JSON.stringify({ zh_cn: { title: '', content: o.paragraphs } }), mentions: mentions(o.mention),
-+    },
-+    sender: sender(o),
-+  };
++    persistentExecutor: { enabled: true },
++  } as BotConfigBase;
 +}
 +
-+function makeHandler(cfg: Partial<BotConfig> = {}) {
-+  const received: IncomingMessage[] = [];
-+  const sent: string[] = [];
-+  const messageSender: any = {
-+    sendText: async (_chatId: string, text: string) => { sent.push(text); },
-+    getChatMemberCount: async () => 2,
-+  };
-+  const config = { name: 'demo', feishu: { appId: 'a', appSecret: 'b' }, ...cfg } as BotConfig;
-+  const handle = createReceiveHandler(config, logger, (m) => received.push(m), BOT, messageSender);
-+  return { handle, received, sent };
++function makeSender() {
++  return {
++    async sendCard() { return 'msg-1'; },
++    async updateCard() { return true; },
++    async sendQuestionCard() { return 'q-1'; },
++    async updateQuestionCard() { return true; },
++    async sendTextNotice() {},
++    async sendText() { return 'txt-1'; },
++  } as any;
 +}
 +
-+describe('patch S: private chats require @mention', () => {
-+  it('p2p without @ is silently dropped (no hint reply); with @ is processed and tag stripped', async () => {
-+    const h = makeHandler();
-+    const chatId = fresh('oc');
-+    await h.handle(textEvent({ chatId, chatType: 'p2p', text: 'hi' }));
-+    expect(h.received).toHaveLength(0);
-+    expect(h.sent).toHaveLength(0);
-+    await h.handle(textEvent({ chatId: fresh('oc'), chatType: 'p2p', text: 'hi', mention: true }));
-+    expect(h.received).toHaveLength(1);
-+    expect(h.received[0].text).toBe('hi');
++function writeTranscript(cwd: string, ageMs: number, compacted: boolean) {
++  const p = transcriptPathFor(cwd, SID);
++  fs.mkdirSync(path.dirname(p), { recursive: true });
++  fs.writeFileSync(p, '{"type":"user"}\n' + (compacted ? COMPACT_LINE : '') + '{"type":"user"}\n');
++  const t = (Date.now() - ageMs) / 1000;
++  fs.utimesSync(p, t, t);
++}
++
++beforeEach(() => {
++  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rollover-bridge-'));
++  savedHome = process.env.HOME;
++  savedStore = process.env.SESSION_STORE_DIR;
++  process.env.HOME = path.join(tmp, 'home');
++  fs.mkdirSync(process.env.HOME, { recursive: true });
++  process.env.SESSION_STORE_DIR = path.join(tmp, 'store');
++  auditCalls.length = 0;
++  _resetScanCache();
++});
++
++afterEach(() => {
++  process.env.HOME = savedHome;
++  if (savedStore === undefined) delete process.env.SESSION_STORE_DIR;
++  else process.env.SESSION_STORE_DIR = savedStore;
++  fs.rmSync(tmp, { recursive: true, force: true });
++  vi.restoreAllMocks();
++});
++
++function makeBridge(cwd: string) {
++  const bridge = new MessageBridge(makeConfig(cwd), logger, makeSender()) as any;
++  bridge.releaseChatExecutor = vi.fn(async () => {});
++  return bridge;
++}
++
++describe('maybeRolloverSession (shared orchestration)', () => {
++  it('rolls over an idle+compacted session: clears sessionId, audits, renders handoff from registry', async () => {
++    const cwd = path.join(tmp, 'proj');
++    writeTranscript(cwd, 5 * H, true);
++    const bridge = makeBridge(cwd);
++    bridge.sessionManager.setSessionId('chat-a', SID, 'claude');
++    bridge.sessionRegistry = {
++      findByChatId: () => ({ id: 'reg-1' }),
++      getMessages: () => [
++        { role: 'user', text: '帮我出三张海报', timestamp: 1 },
++        { role: 'assistant', text: '三张海报做好了', timestamp: 2 },
++      ],
++    };
++    const session = bridge.sessionManager.getSession('chat-a');
++    const r = await bridge.maybeRolloverSession('chat-a', session, 'claude', 'u1', 'api');
++    expect(r.rolledOver).toBe(true);
++    expect(r.handoffReminder).toContain('<system-reminder>');
++    expect(r.handoffReminder).toContain('三张海报做好了');
++    expect(bridge.sessionManager.getSession('chat-a').sessionId).toBeUndefined();
++    expect(bridge.releaseChatExecutor).toHaveBeenCalledWith('chat-a', 'idle-compacted-rollover');
++    const ev = auditCalls.find(c => c.event === 'session_rollover');
++    expect(ev).toBeTruthy();
++    expect(ev.source).toBe('api'); // AuditLogger 把 meta 摊平到顶层
++    expect(ev.previousSessionId).toBe(SID);
++    try { bridge.destroy(); } catch { /* ignore */ }
 +  });
 +
-+  it('a mention of someone else does not count', async () => {
-+    const h = makeHandler();
-+    const ev = textEvent({ chatId: fresh('oc'), chatType: 'p2p', text: 'hi', mention: true });
-+    ev.message.mentions = [{ key: '@_user_1', id: { open_id: 'ou_other' }, name: 'x' }];
-+    await h.handle(ev);
-+    expect(h.received).toHaveLength(0);
++  it('leaves a never-compacted or recently-used session alone', async () => {
++    const cwd = path.join(tmp, 'proj');
++    const bridge = makeBridge(cwd);
++    bridge.sessionManager.setSessionId('chat-b', SID, 'claude');
++    const session = bridge.sessionManager.getSession('chat-b');
++
++    writeTranscript(cwd, 5 * H, false); // idle but never compacted
++    expect((await bridge.maybeRolloverSession('chat-b', session, 'claude', 'u1', 'message')).rolledOver).toBe(false);
++    _resetScanCache();
++    writeTranscript(cwd, 10 * 60_000, true); // compacted but used 10 min ago
++    expect((await bridge.maybeRolloverSession('chat-b', session, 'claude', 'u1', 'message')).rolledOver).toBe(false);
++    expect(bridge.sessionManager.getSession('chat-b').sessionId).toBe(SID);
++    expect(auditCalls.find(c => c.event === 'session_rollover')).toBeUndefined();
++    try { bridge.destroy(); } catch { /* ignore */ }
 +  });
 +
-+  it('2-member groups are groups: @ required, no member-count exemption', async () => {
-+    const h = makeHandler();
-+    const chatId = fresh('oc');
-+    await h.handle(textEvent({ chatId, chatType: 'group', text: 'hi' }));
-+    expect(h.received).toHaveLength(0);
-+    await h.handle(textEvent({ chatId, chatType: 'group', text: 'hi', mention: true }));
-+    expect(h.received).toHaveLength(1);
-+  });
-+
-+  it('groupNoMention is the only bypass and applies to p2p too', async () => {
-+    const h = makeHandler({ groupNoMention: true });
-+    await h.handle(textEvent({ chatId: fresh('oc'), chatType: 'p2p', text: 'hi' }));
-+    await h.handle(textEvent({ chatId: fresh('oc'), chatType: 'group', text: 'hi' }));
-+    expect(h.received).toHaveLength(2);
-+  });
-+
-+  it('groupOnly whitelist gate runs before the @ gate', async () => {
-+    const h = makeHandler({ groupOnly: true, groupOnlyAllowUsers: ['ou_admin'] });
-+    await h.handle(textEvent({ chatId: fresh('oc'), chatType: 'p2p', text: 'hi', mention: true, userId: 'ou_x' }));
-+    expect(h.received).toHaveLength(0);
-+    expect(h.sent).toHaveLength(1);
-+    await h.handle(textEvent({ chatId: fresh('oc'), chatType: 'p2p', text: 'hi', userId: 'ou_admin' }));
-+    expect(h.received).toHaveLength(0);
-+    expect(h.sent).toHaveLength(1);
-+    await h.handle(textEvent({ chatId: fresh('oc'), chatType: 'p2p', text: 'hi', mention: true, userId: 'ou_admin' }));
-+    expect(h.received).toHaveLength(1);
++  it('never throws: a failing registry still rolls over without handoff', async () => {
++    const cwd = path.join(tmp, 'proj');
++    writeTranscript(cwd, 5 * H, true);
++    const bridge = makeBridge(cwd);
++    bridge.sessionManager.setSessionId('chat-c', SID, 'claude');
++    bridge.sessionRegistry = { findByChatId: () => { throw new Error('db gone'); } };
++    const r = await bridge.maybeRolloverSession('chat-c', bridge.sessionManager.getSession('chat-c'), 'claude', undefined, 'api');
++    expect(r.rolledOver).toBe(true);
++    expect(r.handoffReminder).toBeUndefined();
++    try { bridge.destroy(); } catch { /* ignore */ }
 +  });
 +});
 +
-+describe('patch S: private un-@ text is cached and prepended on the next @ (the 0904 incident shape)', () => {
-+  it('link + requirement sent first, "@bot 处理以上需求" last → bot sees all three in order', async () => {
-+    const h = makeHandler();
-+    const chatId = fresh('oc');
-+    await h.handle(textEvent({ chatId, chatType: 'p2p', text: 'https://x.feishu.cn/docx/AAA' }));
-+    await h.handle(textEvent({ chatId, chatType: 'p2p', text: '根据会议纪要出一份工作安排' }));
-+    expect(h.received).toHaveLength(0);
-+    await h.handle(textEvent({ chatId, chatType: 'p2p', text: '处理以上需求', mention: true }));
-+    expect(h.received).toHaveLength(1);
-+    expect(h.received[0].text).toBe('https://x.feishu.cn/docx/AAA\n\n根据会议纪要出一份工作安排\n\n处理以上需求');
++describe('executeApiTask (scheduled daily report / API tasks) honours rollover', () => {
++  it('passes freshSession=true and prepends the handoff block to the task prompt', async () => {
++    const cwd = path.join(tmp, 'proj');
++    writeTranscript(cwd, 5 * H, true);
++    const bridge = makeBridge(cwd);
++    bridge.sessionManager.setSessionId('chat-d', SID, 'claude');
++    bridge.sessionRegistry = {
++      findByChatId: () => ({ id: 'reg-1' }),
++      getMessages: () => [{ role: 'assistant', text: '昨天的日报已发', timestamp: 2 }],
++    };
++    let captured: any;
++    bridge.runOneTurn = vi.fn(async (_chatId: string, _engine: string, opts: any) => {
++      captured = opts;
++      throw new Error('stop-here');
++    });
++    await expect(bridge.executeApiTask({ prompt: '请生成本群昨日日报', chatId: 'chat-d' })).rejects.toThrow('stop-here');
++    expect(captured.freshSession).toBe(true);
++    expect(captured.prompt.startsWith('<system-reminder>')).toBe(true);
++    expect(captured.prompt).toContain('昨天的日报已发');
++    expect(captured.prompt.trimEnd().endsWith('请生成本群昨日日报')).toBe(true);
++    expect(bridge.sessionManager.getSession('chat-d').sessionId).toBeUndefined();
++    try { bridge.destroy(); } catch { /* ignore */ }
 +  });
 +
-+  it('text and media interleave: texts joined in order, media become extraMedia', async () => {
-+    const h = makeHandler();
-+    const chatId = fresh('oc');
-+    await h.handle(textEvent({ chatId, chatType: 'p2p', text: 'A' }));
-+    await h.handle(imageEvent({ chatId, chatType: 'p2p', imageKey: 'img_1' }));
-+    await h.handle(fileEvent({ chatId, chatType: 'p2p', fileKey: 'file_1', fileName: 'a.pdf' }));
-+    await h.handle(textEvent({ chatId, chatType: 'p2p', text: 'B' }));
-+    await h.handle(textEvent({ chatId, chatType: 'p2p', text: 'go', mention: true }));
-+    expect(h.received).toHaveLength(1);
-+    expect(h.received[0].text).toBe('A\n\nB\n\ngo');
-+    expect(h.received[0].extraMedia?.map((m) => m.imageKey ?? m.fileKey)).toEqual(['img_1', 'file_1']);
-+  });
-+
-+  it('cache is consumed once and isolated per sender', async () => {
-+    const h = makeHandler();
-+    const chatId = fresh('oc');
-+    await h.handle(textEvent({ chatId, chatType: 'p2p', text: 'A', userId: 'ou_a' }));
-+    await h.handle(textEvent({ chatId, chatType: 'p2p', text: 'go', mention: true, userId: 'ou_b' }));
-+    expect(h.received[0].text).toBe('go');
-+    await h.handle(textEvent({ chatId, chatType: 'p2p', text: 'go', mention: true, userId: 'ou_a' }));
-+    expect(h.received[1].text).toBe('A\n\ngo');
-+    expect(h.received[1].extraMedia).toBeUndefined();
-+    await h.handle(textEvent({ chatId, chatType: 'p2p', text: 'again', mention: true, userId: 'ou_a' }));
-+    expect(h.received[2].text).toBe('again');
-+  });
-+
-+  it('an un-@ quote-reply carries its parentId to the trigger; the trigger\'s own parentId wins', async () => {
-+    const h = makeHandler();
-+    const chatId = fresh('oc');
-+    await h.handle(textEvent({ chatId, chatType: 'p2p', text: '看这个', parentId: 'om_quoted' }));
-+    await h.handle(textEvent({ chatId, chatType: 'p2p', text: '处理', mention: true }));
-+    expect(h.received[0].parentId).toBe('om_quoted');
-+    expect(h.received[0].text).toBe('看这个\n\n处理');
-+
-+    await h.handle(textEvent({ chatId, chatType: 'p2p', text: '看这个', parentId: 'om_old' }));
-+    await h.handle(textEvent({ chatId, chatType: 'p2p', text: '处理', mention: true, parentId: 'om_new' }));
-+    expect(h.received[1].parentId).toBe('om_new');
-+  });
-+
-+  it('@ + image trigger still gets the cached text prepended to the default image prompt', async () => {
-+    const h = makeHandler();
-+    const chatId = fresh('oc');
-+    await h.handle(textEvent({ chatId, chatType: 'p2p', text: '按这个风格' }));
-+    await h.handle(imageEvent({ chatId, chatType: 'p2p', imageKey: 'img_t', mention: true }));
-+    expect(h.received[0].text).toBe('按这个风格\n\n请分析这张图片');
-+    expect(h.received[0].imageKey).toBe('img_t');
-+  });
-+
-+  it('un-@ post in p2p: text cached, its images cached as media', async () => {
-+    const h = makeHandler();
-+    const chatId = fresh('oc');
-+    await h.handle(postEvent({ chatId, chatType: 'p2p', paragraphs: [
-+      [{ tag: 'text', text: '参考图' }],
-+      [{ tag: 'img', image_key: 'img_p1' }],
-+      [{ tag: 'img', image_key: 'img_p2' }],
-+    ] }));
-+    expect(h.received).toHaveLength(0);
-+    await h.handle(textEvent({ chatId, chatType: 'p2p', text: '出图', mention: true }));
-+    expect(h.received[0].text).toBe('参考图\n\n出图');
-+    expect(h.received[0].extraMedia?.map((m) => m.imageKey)).toEqual(['img_p1', 'img_p2']);
-+  });
-+});
-+
-+describe('patch S: group text is NOT cached, group media still is', () => {
-+  it('un-@ group text is dropped for good; media attaches on the next @', async () => {
-+    const h = makeHandler();
-+    const chatId = fresh('oc');
-+    await h.handle(textEvent({ chatId, chatType: 'group', text: '闲聊' }));
-+    await h.handle(imageEvent({ chatId, chatType: 'group', imageKey: 'img_g' }));
-+    await h.handle(textEvent({ chatId, chatType: 'group', text: '看图', mention: true }));
-+    expect(h.received).toHaveLength(1);
-+    expect(h.received[0].text).toBe('看图');
-+    expect(h.received[0].extraMedia?.[0].imageKey).toBe('img_g');
-+  });
-+});
-+
-+describe('patch S: rich-text links keep their URL', () => {
-+  const post = (paragraphs: unknown[][]) => ({ zh_cn: { title: '', content: paragraphs } });
-+
-+  it('label + href → "label (href)"; label that is the URL itself is not duplicated', () => {
-+    expect(extractTextFromPost(post([[
-+      { tag: 'text', text: '见 ' },
-+      { tag: 'a', text: '会议纪要', href: 'https://x.feishu.cn/docx/AAA' },
-+    ]]))).toBe('见 会议纪要 (https://x.feishu.cn/docx/AAA)');
-+    expect(extractTextFromPost(post([[
-+      { tag: 'a', text: 'https://x.feishu.cn/docx/AAA', href: 'https://x.feishu.cn/docx/AAA' },
-+    ]]))).toBe('https://x.feishu.cn/docx/AAA');
-+    expect(extractTextFromPost(post([[{ tag: 'a', text: 'no-href' }]]))).toBe('no-href');
-+  });
-+
-+  it('the URL survives the whole pipeline into the prompt', async () => {
-+    const h = makeHandler();
-+    await h.handle(postEvent({ chatId: fresh('oc'), chatType: 'p2p', mention: true, paragraphs: [[
-+      { tag: 'at', user_id: BOT, user_name: 'bot' },
-+      { tag: 'a', text: '会议纪要', href: 'https://x.feishu.cn/docx/AAA' },
-+    ] ] }));
-+    expect(h.received[0].text).toContain('https://x.feishu.cn/docx/AAA');
++  it('skips rollover for constrained turns (maxTurns / allowedTools, e.g. voice)', async () => {
++    const cwd = path.join(tmp, 'proj');
++    writeTranscript(cwd, 5 * H, true);
++    const bridge = makeBridge(cwd);
++    bridge.sessionManager.setSessionId('chat-e', SID, 'claude');
++    let captured: any;
++    bridge.runOneTurn = vi.fn(async (_c: string, _e: string, opts: any) => {
++      captured = opts;
++      throw new Error('stop-here');
++    });
++    await expect(bridge.executeApiTask({ prompt: 'hi', chatId: 'chat-e', maxTurns: 1 })).rejects.toThrow('stop-here');
++    expect(captured.freshSession).toBe(false);
++    expect(captured.prompt).toBe('hi');
++    expect(bridge.sessionManager.getSession('chat-e').sessionId).toBe(SID);
++    try { bridge.destroy(); } catch { /* ignore */ }
 +  });
 +});
