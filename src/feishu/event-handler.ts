@@ -2,6 +2,7 @@ import * as lark from '@larksuiteoapi/node-sdk';
 import type { BotConfig } from '../config.js';
 import type { Logger } from '../utils/logger.js';
 import { MessageSender } from './message-sender.js';
+import { fetchRoundContext, buildRoundPrompt, type RoundContext } from './round-context.js';
 
 // Re-export from shared types so existing imports continue to work
 export type { IncomingMessage } from '../types.js';
@@ -19,73 +20,6 @@ export interface CardActionEvent {
 }
 
 export type CardActionHandler = (event: CardActionEvent) => void;
-
-// Cache for recent media messages in group chats (file/image sent without @mention).
-// When a user later @mentions the bot, cached media is attached automatically.
-// [本地私改·patch N] TTL 5 分钟太短：2026-07-21 13:29 缓存的两个文件，13:39 @bot 时
-// 已过期被【静默】过滤，用户以为 bot 收到了文件。传大文件、写一段说明再 @，超过
-// 5 分钟太常见。提到 30 分钟（缓存只存 key 不存内容，内存无压力）；过期丢弃必须打
-// WARN（含文件名），事后可从日志还原「用户发过什么、为什么没带上」。
-// 导出 cachePendingMedia/getCachedMedia/MEDIA_CACHE_TTL_MS 仅为单测；生产只有本文件用。
-export const MEDIA_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
-// [本地私改·patch S] 缓存项扩展：私聊里未 @ 的文本（含引用回复的 parentId）与媒体同列
-// 按时间顺序暂存，@ 时文本按序拼到本回合提示词前面、媒体作为附件带上。
-interface CachedMedia {
-  messageId: string;
-  imageKey?: string;
-  fileKey?: string;
-  fileName?: string;
-  /** 未 @ 的文本消息正文（已剥 @ 标记）。 */
-  text?: string;
-  /** 该未 @ 消息本身是引用回复时，被引消息 id。 */
-  parentId?: string;
-  ts: number;
-}
-const pendingMediaCache = new Map<string, CachedMedia[]>(); // key: chatId:userId
-
-function cacheMediaKey(chatId: string, userId: string): string {
-  return `${chatId}:${userId}`;
-}
-
-/** [本地私改·patch N] 入缓存收口成函数（原是调用点内联三行），单测得以直接构造过期条目。 */
-export function cachePendingMedia(chatId: string, userId: string, media: CachedMedia): void {
-  const key = cacheMediaKey(chatId, userId);
-  const items = pendingMediaCache.get(key) || [];
-  items.push(media);
-  pendingMediaCache.set(key, items);
-}
-
-export function getCachedMedia(chatId: string, userId: string, logger?: Logger): CachedMedia[] {
-  const key = cacheMediaKey(chatId, userId);
-  const items = pendingMediaCache.get(key);
-  if (!items) return [];
-  const now = Date.now();
-  const valid = items.filter(m => now - m.ts < MEDIA_CACHE_TTL_MS);
-  // [本地私改·patch N] 过期丢弃绝不静默：WARN 带文件名/图片 key 与滞留时长
-  const expired = items.filter(m => now - m.ts >= MEDIA_CACHE_TTL_MS);
-  if (expired.length > 0 && logger) {
-    logger.warn(
-      {
-        chatId,
-        userId,
-        dropped: expired.map(m => m.fileName || m.imageKey || m.fileKey || (m.text ? m.text.slice(0, 60) : m.messageId)),
-        oldestAgeMs: Math.max(...expired.map(m => now - m.ts)),
-        ttlMs: MEDIA_CACHE_TTL_MS,
-      },
-      'Cached media expired before @mention and was dropped (NOT attached to the task)',
-    );
-  }
-  if (valid.length === 0) {
-    pendingMediaCache.delete(key);
-    return [];
-  }
-  pendingMediaCache.set(key, valid);
-  return valid;
-}
-
-function clearCachedMedia(chatId: string, userId: string): void {
-  pendingMediaCache.delete(cacheMediaKey(chatId, userId));
-}
 
 // Dedup cache for already-processed message ids. Feishu retries webhook delivery
 // (at-least-once) when the handler is slow to respond — e.g. a long-running task
@@ -236,37 +170,14 @@ export function createReceiveHandler(
           ? mentions?.some((m: any) => m.id?.open_id === botOpenId)
           : mentions && mentions.length > 0;
         if (!botMentioned) {
-          // groupNoMention mode: respond to all messages without @mention
-          if (config.groupNoMention) {
-            logger.debug({ chatId, chatType }, 'No-mention mode enabled, processing without @mention');
-          } else if (msgType === 'image' || msgType === 'file') {
-            // Cache media messages for later retrieval when user @mentions bot
-            const media = parseMediaMessage(message, msgType, logger);
-            if (media) {
-              cachePendingMedia(chatId, userId, { ...media, messageId, ts: Date.now() });
-              logger.info({ chatId, chatType, userId, msgType, ...media }, 'Cached media for later @mention');
-            }
-            return;
-          } else if (chatType === 'p2p') {
-            // [本地私改·patch S] 私聊里未 @ 的文本先暂存（团队习惯：先发链接/要求，最后 @ 一句
-            // 「处理」）。0904 生产实锤：KK 私聊发的链接与要求全被静默丢弃，bot 只拿到
-            // 「处理以上需求」。群聊不缓存文本——群里未 @ 的闲聊不是说给 bot 的。
-            const parsed = extractPromptText(message, msgType, logger);
-            if (parsed) {
-              if (parsed.text) {
-                cachePendingMedia(chatId, userId, { messageId, text: parsed.text, parentId, ts: Date.now() });
-              }
-              for (const key of parsed.postImages) {
-                cachePendingMedia(chatId, userId, { messageId, imageKey: key, ts: Date.now() });
-              }
-              logger.info(
-                { chatId, userId, msgType, text: parsed.text.slice(0, 100), postImageCount: parsed.postImages.length, parentId },
-                'Cached private text for later @mention',
-              );
-            }
-            return;
+          if (config.groupNoMention && chatType === 'group') {
+            // groupNoMention mode: respond to all group messages without @mention
+            logger.debug({ chatId, chatType }, 'Group no-mention mode enabled, processing without @mention');
           } else {
-            logger.debug({ chatId, chatType }, 'Ignoring message without @mention');
+            // [本地私改·patch S] 未 @ 的消息一律静默不处理（私聊群聊同）。它们不会丢：
+            // 下次这个人 @ 时，桥接按飞书接口拉「本轮」历史把它们带上（见 round-context.ts），
+            // 不再依赖内存缓存与 30 分钟寿命。
+            logger.debug({ chatId, chatType, msgType }, 'Ignoring message without @mention');
             return;
           }
         }
@@ -342,35 +253,33 @@ export function createReceiveHandler(
           }));
           logger.info({ chatId, postExtraImageCount: postExtraImages.length }, 'Attached extra images from post');
         }
-        // [本地私改·patch S] 接回未 @ 时缓存的内容（私聊与群聊同一路径）：
-        //   媒体 → 附件；文本 → 按时间顺序拼在本条正文前面，触发消息永远在最后；
-        //   本条不是引用回复而缓存里有引用回复时，沿用最早那条的 parentId，让补丁 P 的
-        //   被引内容注入照常工作（只支持一条，多条时后面的被引内容不注入，日志可查）。
-        const cached = getCachedMedia(chatId, userId, logger); // [本地私改·patch N] 过期丢弃要打 WARN
-        if (cached.length > 0) {
-          const cachedMedia = cached
-            .filter(m => m.imageKey || m.fileKey)
-            .map(m => ({
-              messageId: m.messageId,
-              imageKey: m.imageKey,
-              fileKey: m.fileKey,
-              fileName: m.fileName,
-            }));
-          if (cachedMedia.length > 0) {
-            extraMedia = extraMedia ? [...extraMedia, ...cachedMedia] : cachedMedia;
-          }
-          const cachedTexts = cached.filter(m => m.text);
-          if (cachedTexts.length > 0) {
-            text = [...cachedTexts.map(m => m.text as string), text].join('\n\n');
-            if (!parentId) {
-              parentId = cachedTexts.find(m => m.parentId)?.parentId;
-            }
-          }
-          clearCachedMedia(chatId, userId);
-          logger.info(
-            { chatId, userId, mediaCount: cachedMedia.length, textCount: cachedTexts.length, parentId },
-            'Attached cached content to @mention message',
+        // [本地私改·patch S] @ 触发：按飞书接口拉这个人「本轮」（上一条 @ 之后）的消息，
+        //   文本按序拼在本条前面、媒体作附件、引用回复沿用最早那条的被引 id。
+        //   私聊群聊同一机制；groupNoMention 模式下非 @ 消息不拉（没有积压）。
+        //   拉取失败降级为提示词里一句说明，绝不阻塞回合。
+        if (botMentioned && messageSender) {
+          const triggerTimeMs = Number(message.create_time) || Date.now();
+          const round: RoundContext = await fetchRoundContext(
+            (c, st, et, pt) => messageSender.listMessages(c, st, et, pt),
+            { chatId, triggerMessageId: messageId, triggerTimeMs, senderId: userId, botOpenId },
+            { extractPostText: extractTextFromPost, extractPostImages: extractImagesFromPost },
           );
+          if (round.error) {
+            logger.warn({ chatId, chatType, userId, error: round.error, scanned: round.scanned }, 'Round context fetch failed; continuing without it');
+          }
+          if (round.media.length > 0) {
+            extraMedia = extraMedia ? [...extraMedia, ...round.media] : round.media;
+          }
+          if (!parentId) {
+            parentId = round.texts.find(m => m.parentId)?.parentId;
+          }
+          text = buildRoundPrompt(round, text);
+          if (round.texts.length > 0 || round.media.length > 0 || round.truncated) {
+            logger.info(
+              { chatId, chatType, userId, textCount: round.texts.length, mediaCount: round.media.length, truncated: round.truncated, scanned: round.scanned, parentId },
+              'Attached round context to @mention message',
+            );
+          }
         }
 
         onMessage({ messageId, chatId, chatType, userId, parentId, text, imageKey, fileKey, fileName, extraMedia });
@@ -410,32 +319,12 @@ function extractPromptText(
   return { text, postImages };
 }
 
-/** Parse image/file message content, returning media fields or undefined on failure. */
-function parseMediaMessage(
-  message: any, msgType: string, logger: Logger,
-): { imageKey?: string; fileKey?: string; fileName?: string } | undefined {
-  try {
-    const content = JSON.parse(message.content);
-    if (msgType === 'image') {
-      const imageKey = content.image_key;
-      return imageKey ? { imageKey } : undefined;
-    }
-    if (msgType === 'file') {
-      const fileKey = content.file_key;
-      const fileName = content.file_name;
-      return (fileKey && fileName) ? { fileKey, fileName } : undefined;
-    }
-  } catch {
-    logger.warn({ msgType }, 'Failed to parse media message for caching');
-  }
-  return undefined;
-}
-
 /**
  * Extract all image_keys from a Feishu post (rich text) message.
  * Looks for { tag: "img", image_key: "..." } elements in the post content.
  */
-function extractImagesFromPost(content: Record<string, unknown>): string[] {
+// [本地私改·patch S] 导出供 round-context 复用富文本图片解析；生产逻辑不变。
+export function extractImagesFromPost(content: Record<string, unknown>): string[] {
   const bodies: Array<Record<string, unknown>> = [];
 
   if (Array.isArray(content.content)) {
