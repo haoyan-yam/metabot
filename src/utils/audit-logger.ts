@@ -13,7 +13,9 @@ export type AuditEvent =
   | 'command'
   | 'auth_denied'
   | 'api_task_start'
-  | 'api_task_complete';
+  | 'api_task_complete'
+  // [本地私改·patch T] 空闲+已压缩会话自动换新
+  | 'session_rollover';
 
 export interface AuditEntry {
   event: AuditEvent;

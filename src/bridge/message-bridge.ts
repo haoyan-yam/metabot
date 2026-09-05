@@ -50,6 +50,7 @@ import { sendFinalCardWithRetry, sendPlanContent } from './final-delivery.js';
 import { isDefaultMediaText, mergeBatchMessages, mergeBatchWithText, mergeSameSenderMessages, type PendingBatch } from './media-batch.js';
 import { sendCompletionNotice } from './notification-policy.js';
 import { normalizePromptForEngine } from './prompt-normalizer.js';
+import { decideRollover, renderHandoffReminder, type HandoffTurn } from './session-rollover.js';
 import { SlashPickerController } from './slash-picker-controller.js';
 import { extractSpontaneousSnippet, formatSpontaneousCardBody } from './spontaneous-activity.js';
 import type { AgentTeamStore } from '../agent-teams/team-store.js';
@@ -1975,6 +1976,44 @@ export class MessageBridge {
     const activeEngine = session.engine ?? resolveEngineName(this.config);
     const enginePromptText = normalizePromptForEngine(text, activeEngine);
 
+    // [本地私改·patch T] 空闲 ≥3h 且已压缩过的会话：本回合开新会话，并把旧会话最近几轮
+    // 作为交接注入。判定与渲染是纯函数（session-rollover.ts），这里只做编排；任何一步
+    // 出错都退回「照常 resume」，绝不让本回合失败。交接内容要在清掉 sessionId 之前取。
+    let rolledOver = false;
+    let handoffReminder: string | undefined;
+    try {
+      const decision = decideRollover({
+        cwd,
+        sessionId: session.sessionId,
+        engine: engineName,
+        hasActiveGoal: !!session.activeGoal,
+      });
+      this.logger.debug({ chatId, ...decision, transcriptPath: undefined }, 'session rollover check');
+      if (decision.rollover) {
+        handoffReminder = this.buildHandoffReminder(chatId, decision.idleMs ?? 0);
+        const previousSessionId = this.sessionManager.rolloverSession(chatId);
+        try {
+          await this.releaseChatExecutor(chatId, 'idle-compacted-rollover');
+        } catch (err) {
+          this.logger.warn({ err, chatId }, 'rollover: failed to release persistent executor');
+        }
+        rolledOver = true;
+        const idleHours = Math.round(((decision.idleMs ?? 0) / 3_600_000) * 10) / 10;
+        this.logger.info({ chatId, previousSessionId, idleHours, handoff: !!handoffReminder }, 'session rolled over: idle + compacted');
+        this.audit.log({
+          event: 'session_rollover',
+          botName: this.config.name,
+          chatId,
+          userId,
+          meta: { previousSessionId, idleHours, handoff: !!handoffReminder },
+        });
+      }
+    } catch (err) {
+      this.logger.warn({ err, chatId }, 'session rollover check failed; resuming as usual');
+      rolledOver = false;
+      handoffReminder = undefined;
+    }
+
     // Prepare downloads directory (bot-isolated)
     const downloadsDir = this.config.claude.downloadsDir;
     fs.mkdirSync(downloadsDir, { recursive: true });
@@ -2151,6 +2190,11 @@ export class MessageBridge {
       this.logger.info({ chatId, secondsAgo: secs }, 'injected post-restart reminder into first turn');
     }
 
+    // [本地私改·patch T] 新会话首回合：交接块放最顶上（在提问人/引用/重启提醒之前）。
+    if (rolledOver && handoffReminder) {
+      prompt = `${handoffReminder}\n\n${prompt}`;
+    }
+
     let codexGoalIteration = 0;
     let codexGoalMaxIterations = 0;
     if (engineName === 'codex' && activeGoal) {
@@ -2170,6 +2214,9 @@ export class MessageBridge {
       apiContext,
       model: session.model,
       onTeamEvent,
+      // [本地私改·patch T] 换新会话时不 resume（sessionId 已清，这里再显式声明一次以防
+      // 某处 getSession 复活了旧值）
+      freshSession: rolledOver,
     });
 
     // Register running task
@@ -3044,6 +3091,25 @@ export class MessageBridge {
    * Card updates don't trigger Feishu mobile push notifications, but new messages do.
    * Only sends for tasks that took longer than 10 seconds.
    */
+  /**
+   * [本地私改·patch T] 从 SessionRegistry 取本群最近几轮（只含真正到达 bot 的回合）
+   * 渲染成交接块。没有 registry / 没有记录 → undefined（新会话照开，只是不带交接）。
+   */
+  private buildHandoffReminder(chatId: string, idleMs: number): string | undefined {
+    if (!this.sessionRegistry) return undefined;
+    try {
+      const record = this.sessionRegistry.findByChatId(chatId);
+      if (!record) return undefined;
+      const turns: HandoffTurn[] = this.sessionRegistry
+        .getMessages(record.id)
+        .map(m => ({ role: m.role, text: m.text, timestamp: m.timestamp }));
+      return renderHandoffReminder({ turns, idleMs });
+    } catch (err) {
+      this.logger.warn({ err, chatId }, 'rollover: failed to build handoff reminder');
+      return undefined;
+    }
+  }
+
   /** Record session and messages in the cross-platform registry. */
   private recordSession(chatId: string, prompt: string, responseText: string | undefined, claudeSessionId: string | undefined, costUsd: number | undefined, durationMs: number | undefined): void {
     if (!this.sessionRegistry) return;
