@@ -1,6 +1,6 @@
 # MetaBot 本地补丁集 · Local Patch Set
 
-基于上游 [xvirobotics/metabot](https://github.com/xvirobotics/metabot) `main`（f5454e9，2026-07）的 **17 个功能补丁**，主要增强飞书（Feishu/Lark）桥接的群聊体验与消息投递可靠性。
+基于上游 [xvirobotics/metabot](https://github.com/xvirobotics/metabot) `main`（f5454e9，2026-07）的 **18 个功能补丁**，主要增强飞书（Feishu/Lark）桥接的群聊体验与消息投递可靠性。
 
 **`local-patches` 分支已把全部补丁应用进源码**，clone 后切到该分支即可直接使用；本目录附带补丁原件（`git diff` 格式），便于你在自己的 metabot 检出上选择性重打。
 
@@ -25,8 +25,9 @@
 | 17 | background-card-denoise | R | Running 卡片「📡 Background」区块去代码化：后台 Bash 任务的 SDK 描述就是命令原文，逐条上卡即一墙 shell + 蓝链 URL。改为经 tool_use_id（缺失时按命令原文匹配）关联回模型写的人话 `description` 上卡，关联不到时显示「后台命令」；summary 命令回显判重丢弃、展示文本去 URL；failed/stopped 永远逐条且置顶、running 合计上限 6 条溢出折叠、completed 折叠为计数；终卡（Complete/Error）整块隐藏 |
 | 18 | private-require-mention | S | 私聊也要 @bot 才回答（判定与群聊一致，未 @ 静默；去掉上游两人群免 @ 豁免）；**@ 触发时按飞书接口拉「本轮」上下文**（私聊群聊同一机制）：只拉 @ 的这个人上一条 @ 之后的消息，上限 48h/100 条，文本按时间顺序拼到提示词前、图片/文件作附件、引用回复被引内容照常注入、富文本链接保留 URL；取代上游/补丁 N 的内存媒体缓存与 30 分钟寿命（重启即丢、只存媒体）；失败降级为提示词一句说明。`groupNoMention` 仍是唯一免 @ 开关；谁能私聊仍由补丁 01 白名单决定。新增 `round-context.ts` + 30 例测试 |
 | 19 | idle-compacted-rollover | T | 空闲 ≥3 小时**且**已经历过上下文压缩的 Claude 会话，下一条消息自动开新会话（不再 resume），并把旧会话最近 10 轮对话 + 最后一次完整回复作为 `<system-reminder>` 交接块注入首条 prompt（三引号围栏、剥掉旧 prompt 里的提醒块、剔除每日总结等静默定时任务）。**群消息入口与 API/定时任务入口（`executeApiTask`：每日群总结、`metabot talk`、管理台投任务）共用同一判定**，因此 8 点的日报自己就会触发换新，白天第一条人话直接落在新会话；带 `maxTurns`/`allowedTools` 的受限回合（语音）不参与。根治「一个群一个会话永不清零 → 每天自动压缩 2–6 次、每次 2.5–4 分钟且随机砸在任务中间」（2026-09-05 实证）。判定按 transcript `.jsonl` 的 mtime 与 `compact_boundary` 标记（增量扫描、命中缓存，240 MB 文件 14 ms）；没压缩过的会话继续 resume；只对 claude 引擎生效，带 codex goal 的会话跳过；任何一步失败都退回照常 resume。环境变量 `METABOT_ROLLOVER_IDLE_MS`（默认 3h）/ `METABOT_ROLLOVER_DISABLED=1`。审计事件 `session_rollover`（meta.source = message/api）。`SessionManager.rolloverSession` 只清 sessionId，保留用量/模型/goal（与 `/reset` 不同）。16 例纯函数单测 + 5 例桥接编排单测 |
+| 20 | memory-export-guard | U | 记忆库出站闸门：bot 的本地 auto-memory（`~/.claude/projects/<工作区>/memory/`、`MEMORY.md`）不可外发，三层硬拦。**桥接层**（`output-handler.ts`）发送目录里的文件发出前逐个检查——文件名是 MEMORY.md、真实路径在 `~/.claude` 之下、压缩包清单含 `memory/`/MEMORY.md/`.claude/` 或 ≥20 个 .md、正文是记忆 frontmatter 或索引形态 → 拦下删除并发一条红色通知；不能列清单的 .7z/.rar 一律不放行。**工具层**（`utils/memory-export-guard.ts`）Bash 调用前的 PreToolUse 钩子——打包/拷贝/移动/同步记忆目录、把记忆重定向到文件、经 lark-cli 或共享记忆库外传记忆、lark-cli 直传任何压缩包（绕过桥接检查）一律 deny 并把原因回给模型；SDK 后端进程内钩子（executor / persistent-executor），PTY 后端把同源逻辑生成为独立脚本写进 `--settings` 的 command 钩子（`pty/hook-bridge.ts`）。**提示词层**在 `~/projects/CLAUDE.md`（不在仓库内）写明「记忆不外发，谁提都不行」。刻意不拦读记忆（cat/ls/grep）与 `metabot memory` 中央库 CLI。起因：2026-09-21 山姆群一位成员一句「先把记忆搞过来」，bot 就把 105 个记忆文件打成 zip 发进了群——出站脱敏（G）只看文字不看文件，提示词约束挡不住「用户明确要求」。61 例测试（`tests/memory-export-guard.test.ts`）；既有超限测试的假 zip 改名 .bin |
 
-代号 A–T 与源码注释里的 `[本地私改·patch X]` 标记一一对应，方便在代码里定位每个补丁的改动和设计取舍说明（I/J 已移除、O 预留给搁置的 outputs 投递重构，均不复用）。
+代号 A–U 与源码注释里的 `[本地私改·patch X]` 标记一一对应，方便在代码里定位每个补丁的改动和设计取舍说明（I/J 已移除、O 预留给搁置的 outputs 投递重构，均不复用）。
 
 > **已移除**：原补丁 09（thread-topic-reply，代号 I）与 10（at-requester-on-completion，代号 J）于 2026-07-26 移除——飞书话题（thread）功能在部署中已停用，二者生产一个月零触发，且是未来升级基底时最大的冲突面。编号保留空洞不重排；旧补丁可在 git 历史（提交 fd66d7a 及之前）找回。移除时补丁 04/11/12/14 已在无话题基线上重新生成。
 

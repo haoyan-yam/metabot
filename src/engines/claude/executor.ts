@@ -9,6 +9,7 @@ import type { CodexReasoningEffort } from '../../config.js';
 import type { Logger } from '../../utils/logger.js';
 import { AsyncQueue } from '../../utils/async-queue.js';
 import { makeCanUseTool } from './exit-plan-mode.js';
+import { createMemoryGuardHook } from '../../utils/memory-export-guard.js';
 
 const isWindows = process.platform === 'win32';
 
@@ -556,11 +557,17 @@ export class ClaudeExecutor {
     // separate card (StreamProcessor + sendPlanContent).
     queryOptions.canUseTool = makeCanUseTool(this.logger);
 
+    const memoryGuardHook = createMemoryGuardHook(this.logger); // [本地私改·补丁 U]
     queryOptions.hooks = {
       PreToolUse: [
         {
           matcher: 'AskUserQuestion',
           hooks: [askUserQuestionHook as any],
+        },
+        {
+          // [本地私改·补丁 U] 记忆库出站闸门：打包/拷贝/重定向/外传本地记忆的 Bash 命令一律 deny
+          matcher: 'Bash',
+          hooks: [memoryGuardHook as any],
         },
       ],
       TaskCreated: [{ hooks: [teamObserverHook('task_created') as any] }],

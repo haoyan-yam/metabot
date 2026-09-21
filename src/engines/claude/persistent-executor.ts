@@ -37,6 +37,7 @@ import { AsyncQueue } from '../../utils/async-queue.js';
 import type { SDKMessage, TeamEvent, ApiContext } from './executor.js';
 import { apply1MContextSettings } from './executor.js';
 import { makeCanUseTool } from './exit-plan-mode.js';
+import { createMemoryGuardHook } from '../../utils/memory-export-guard.js';
 import { ptyQuery } from './pty/pty-query.js';
 import type {
   PtyQueryOptions,
@@ -878,11 +879,17 @@ export class PersistentClaudeExecutor extends EventEmitter {
       };
     };
 
+    const memoryGuardHook = createMemoryGuardHook(this.options.logger); // [本地私改·补丁 U]
     return {
       PreToolUse: [
         {
           matcher: 'AskUserQuestion',
           hooks: [askUserQuestionHook as any],
+        },
+        {
+          // [本地私改·补丁 U] 记忆库出站闸门：打包/拷贝/重定向/外传本地记忆的 Bash 命令一律 deny
+          matcher: 'Bash',
+          hooks: [memoryGuardHook as any],
         },
       ],
       TaskCreated: [{ hooks: [teamObserver('task_created') as any] }],
